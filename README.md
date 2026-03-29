@@ -1,10 +1,10 @@
-Petanque Pro Master
+Petanque Tournament
 English | Deutsch
 
-<a name="english"></a>
+**ENGLISH**
 
 English: Overview
-Petanque Pro Master is a lightweight, desktop-based tournament management system designed specifically for Petanque and Boule clubs. It simplifies player registration, match pairing via the Swiss System, and real-time score tracking.
+Petanque Tournament Manager is a lightweight, desktop-based tournament management system designed specifically for Petanque and Boule clubs. It simplifies player registration, match pairing via the Swiss System, and real-time score tracking.
 
 Key Features
 Live Dashboard: A high-contrast, fullscreen Public Display for players to see current rankings and court assignments.
@@ -24,10 +24,10 @@ Bash
 pip install pandas pillow openpyxl
 Run: Execute python main.py and ensure boule icon.png is in the same directory.
 
-<a name="deutsch"></a>
+**Deutsch**
 
-Deutsch: Übersicht
-Petanque Pro Master ist eine schlanke Desktop-Anwendung zur Turnierverwaltung, speziell entwickelt für Petanque- und Boule-Vereine. Sie vereinfacht die Anmeldung, die Auslosung nach dem Schweizer System und die Ergebniserfassung.
+
+Petanque Tournament Manager ist eine schlanke Desktop-Anwendung zur Turnierverwaltung, speziell entwickelt für Petanque- und Boule-Vereine. Sie vereinfacht die Anmeldung, die Auslosung nach dem Schweizer System und die Ergebniserfassung.
 
 Hauptfunktionen
 Live-Dashboard: Eine kontrastreiche Vollbildanzeige für Spieler, um aktuelle Ranglisten und Bahnbelegungen in Echtzeit zu verfolgen.
