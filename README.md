@@ -9,7 +9,7 @@ Petanque Tournament Manager is a lightweight, desktop-based tournament managemen
 Key Features
 Live Dashboard: A high-contrast, fullscreen Public Display for players to see current rankings and court assignments.
 
-Smart Matchmaking: Supports the Swiss System and Super Melee with automatic terrain and court allocation.
+Smart Matchmaking: Supports the Swiss System and Super Melee with automatic court allocation.
 
 Data Management: SQLite database backend for reliability, with one-click Excel export for final results.
 
@@ -22,7 +22,7 @@ Installation:
 
 Bash
 pip install pandas pillow openpyxl
-Run: Execute python main.py and ensure boule icon.png is in the same directory.
+Run: Execute python Tournament_Manager.py and ensure boule icon.png is in the same directory.
 
 **Deutsch**
 
@@ -45,7 +45,7 @@ Installation:
 
 Bash
 pip install pandas pillow openpyxl
-Start: Führen Sie python main.py aus. Stellen Sie sicher, dass sich boule icon.png im selben Verzeichnis befindet.
+Start: Führen Sie python Tournament_Manager_De.py aus. Stellen Sie sicher, dass sich boule icon.png im selben Verzeichnis befindet.
 
 Tech Stack / Technologien
 Language: Python 3
@@ -59,7 +59,7 @@ Image Handling: PIL (Pillow)
 Data Export: Pandas and Openpyxl
 
 Project Structure / Projektstruktur
-main.py: The core application logic / Hauptlogik der Anwendung.
+Tournament_Manager.py: The core application logic / Hauptlogik der Anwendung.
 
 boule icon.png: The dashboard logo / Das Logo für die Anzeige.
 
