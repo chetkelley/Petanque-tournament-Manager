@@ -1,0 +1,4 @@
+([('PetanqueTournamentManager',
+   '/Users/chet/Projects/Boule Tournament '
+   'Manager/dist/PetanqueTournamentManager',
+   'EXECUTABLE')],)

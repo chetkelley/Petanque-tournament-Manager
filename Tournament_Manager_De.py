@@ -351,7 +351,7 @@ class PetanqueProMaster:
             self.dash_tree.heading(col, text=head)
         self.dash_tree.pack(fill="x", padx=50)
 
-        tk.Label(self.dash, text="📍 AKTUELL AUF DEN BAHNEN", font=("Segoe UI", 32, "bold"), bg="#000000", fg="#00FF7F").pack(pady=20)
+        tk.Label(self.dash, text="AKTUELL AUF DEN BAHNEN", font=("Segoe UI", 32, "bold"), bg="#000000", fg="#00FF7F").pack(pady=20)
 
         self.dash_msg = tk.Label(self.dash, text="WILLKOMMEN!", font=("Segoe UI", 36, "bold"), bg="#c0392b", fg="white", pady=15)
         self.dash_msg.pack(side="bottom", fill="x")
@@ -363,33 +363,41 @@ class PetanqueProMaster:
 
     def update_dashboard(self):
         if not hasattr(self, 'dash') or not self.dash.winfo_exists(): return
+        
+        # 1. Update Clock
         self.dash_clock.config(text=datetime.datetime.now().strftime("%H:%M:%S"))
         
+        # 2. Update Banner (FETCH FROM ENTRY)
+        new_msg = self.announce_entry.get()
+        self.dash_msg.config(text=new_msg.upper())
+        
+        # 3. Update Rankings
         for i in self.dash_tree.get_children(): self.dash_tree.delete(i)
         conn = sqlite3.connect(self.db_path)
         standings = conn.execute("SELECT name, wins, diff FROM players ORDER BY wins DESC, diff DESC LIMIT 10").fetchall()
         for i, row in enumerate(standings, 1):
             self.dash_tree.insert("", "end", values=(i, f" {row[0]}", row[1], row[2]))
 
+        # 4. Update Matches
         active_matches = conn.execute("SELECT terrain, t1, t2 FROM matches WHERE status='Spielt' ORDER BY terrain ASC").fetchall()
         waiting_matches = conn.execute("SELECT t1, t2 FROM matches WHERE status='Wartend'").fetchall()
-        
-        self.dash_match_text.config(state="normal")
+        conn.close()
+
+        self.dash_match_text.config(state="normal") # Unlock for editing
         self.dash_match_text.delete("1.0", "end")
         
         if not active_matches and not waiting_matches:
             self.dash_match_text.insert("end", "\n\n--- RUNDE BEENDET ---")
         else:
-            # Aktive Spiele
             for row in active_matches:
                 self.dash_match_text.insert("end", f"BAHN {row[0]}:  {row[1]} vs {row[2]}\n")
             
-            # Warteschlange (kleiner oder farblich abgesetzt)
             if waiting_matches:
                 self.dash_match_text.insert("end", "\n--- WARTESCHLEIFE ---\n")
                 for row in waiting_matches:
                     self.dash_match_text.insert("end", f"DEMNÄCHST: {row[0]} vs {row[1]}\n")
-                    
+        
+        self.dash_match_text.config(state="disabled") # Lock so users can't type in it
         self.dash.after(1000, self.update_dashboard)
 
 if __name__ == "__main__":
