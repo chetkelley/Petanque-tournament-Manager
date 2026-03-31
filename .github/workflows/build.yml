@@ -18,10 +18,10 @@ jobs:
           pip install pandas openpyxl pyinstaller
           
       - name: Build EXE
-        run: pyinstaller --noconsole --onefile --name "PetanquePro_DE" Tournament_Manager_De.py
+        run: pyinstaller --noconsole --onefile --name "Tournament_Manager_De" Tournament_Manager_De.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
-          name: PetanquePro-Windows-EXE
+          name: Tournament-Manager-EXE
           path: dist/PetanquePro_DE.exe
