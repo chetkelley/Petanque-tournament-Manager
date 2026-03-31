@@ -1,27 +1,33 @@
 name: Build Windows EXE
-on: [push]
+
+on:
+  push:
+    branches: [ main ]  # This triggers the build every time you push to 'main'
 
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
 
-      - name: Install Dependencies
-        run: |
-          pip install pandas openpyxl pyinstaller
-          
-      - name: Build EXE
-        run: pyinstaller --noconsole --onefile --name "PetanquePro_DE" Tournament_Manager_De.py
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pandas pillow openpyxl pyinstaller
 
-      - name: Upload EXE
-        uses: actions/upload-artifact@v4
-        with:
-          name: PetanquePro-Windows-EXE
-          path: dist/PetanquePro_DE.exe
+    - name: Build with PyInstaller
+        # This is your specific command with the icon and the PIL fix
+      run: pyinstaller --noconsole --onefile --hidden-import=PIL --add-data "boule icon.png;." Tournament_Manager_De.py
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: TournamentManager
+        path: dist/Tournament_Manager.exe
