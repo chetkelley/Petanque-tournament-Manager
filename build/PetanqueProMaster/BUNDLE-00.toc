@@ -1,3 +1,0 @@
-([('PetanqueProMaster',
-   '/Users/chet/Projects/Boule Tournament Manager/dist/PetanqueProMaster',
-   'EXECUTABLE')],)
