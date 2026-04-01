@@ -477,124 +477,191 @@ class PetanqueProMaster:
         messagebox.showinfo("Success", msg)
 
     def open_dashboard(self):
-        """High-Visibility Scoreboard for Windows Monitors."""
         self.dash = tk.Toplevel(self.root)
         self.dash.title("OFFICIAL TOURNAMENT SCOREBOARD")
-        self.dash.state('zoomed') # This opens the window MAXIMIZED on Windows
-        self.dash.configure(bg="#000000") # Pure black for maximum contrast
+        self.dash.state('zoomed') 
+        self.dash.configure(bg="#000000") 
 
-        # --- Header Section ---
+        # --- 1. OS DETECTION & THEMING (Done ONCE) ---
+        current_os = platform.system()
+        style = ttk.Style()
+
+        if current_os == "Darwin":  # macOS
+            style.theme_use("aqua")
+            main_font = "Helvetica Neue"
+            header_bg = "#003366" # Deep Navy Blue for contrast
+            header_fg = "#003366" # Pure White Text
+            row_h = 60
+        else:  # Windows
+            style.theme_use("clam")
+            main_font = "Segoe UI"
+            header_bg = "#003366"
+            header_fg = "#FFFFFF"
+            row_h = 50
+
+        style.configure("Dash.Treeview", 
+                        background="#1a1a1a", 
+                        foreground="white", 
+                        fieldbackground="#1a1a1a", 
+                        font=(main_font, 32), 
+                        rowheight=row_h)
+        
+        # --- THE FIX FOR WHITE-ON-WHITE HEADERS ---
+        style.configure("Dash.Treeview.Heading", 
+                        background=header_bg, 
+                        foreground=header_fg, 
+                        font=(main_font, 22, "bold"))
+
+        # Mac 'Aqua' theme is stubborn. We must 'map' the background 
+        # to ensure it stays dark even when clicked or hovered.
+        style.map("Dash.Treeview.Heading",
+                  background=[('active', header_bg), ('!disabled', header_bg)],
+                  foreground=[('active', header_fg), ('!disabled', header_fg)])
+            
+        # --- 2. HEADER SECTION ---
         header_frame = tk.Frame(self.dash, bg="#000000")
         header_frame.pack(fill="x", pady=20)
         
-        # Left Side: Title
-        tk.Label(header_frame, text="🏆 LEADERBOARD", font=("Segoe UI", 28, "bold"), 
+        # Note: No quotes around main_font here!
+        tk.Label(header_frame, text="🏆 LEADERBOARD", font=(main_font, 28, "bold"), 
                  bg="#000000", fg="#FFD700").pack(side="left", padx=50)
         
-        # Right Side: Icon and Clock Container
+        # Right Side: Icon and Clock
         right_container = tk.Frame(header_frame, bg="#000000")
         right_container.pack(side="right", padx=50)
 
-        # THE ICON: Using a Petanque/Boule-style symbol or a Trophy
+        # 1. THE ICON (Placed first so it's on the far right)
         try:
-            img_path = resource_path("boule icon.png") # <--- USE THE FUNCTION
+            from PIL import Image, ImageTk
+            img_path = resource_path("boule icon.png") 
             img = Image.open(img_path)
-            img = img.resize((100, 100), Image.Resampling.LANCZOS)
+            img = img.resize((80, 80), Image.Resampling.LANCZOS)
             
-            # 1. Create the PhotoImage
             photo = ImageTk.PhotoImage(img)
-            
-            # 2. Create the Label
             icon_label = tk.Label(right_container, image=photo, bg="#000000")
-            
-            # 3. CRITICAL: Keep a manual reference
-            icon_label.image = photo 
-            
+            icon_label.image = photo # Keep reference!
             icon_label.pack(side="right", padx=10)
-            
         except Exception as e:
             print(f"Icon error: {e}")
-        
-        # Live Clock in the top right
-        self.dash_clock = tk.Label(header_frame, text="", font=("Consolas", 24), 
+
+        # 2. THE CLOCK (Placed to the left of the icon)
+        self.dash_clock = tk.Label(right_container, text="", font=("Consolas", 24), 
                                    bg="#000000", fg="#00FF00")
-        self.dash_clock.pack(side="right", padx=50)
+        self.dash_clock.pack(side="right", padx=20)
 
-        # --- Standings Table ---
-        # Windows needs a specific 'style' to make Treeview fonts large
-        style = ttk.Style()
-        style.theme_use("clam") # 'clam' allows better color control on Windows
-        # 1. THE MAIN ROWS (Black background, White text)
-        style.configure("Dash.Treeview", 
-                        background="#1a1a1a", 
-                        foreground="#FFFFFF", 
-                        fieldbackground="#1a1a1a", 
-                        font=("Segoe UI", 20), 
-                        rowheight=45)
+        # --- 3. STANDINGS TABLE ---
+        # --- 1. THE STYLE FIX (Add this where you define your styles) ---
+        # This prevents the text from turning black when you click away
+        style.map("Dash.Treeview", 
+                  foreground=[('selected', 'white'), ('!disabled', 'white')],
+                  background=[('selected', '#34495e'), ('!disabled', '#1a1a1a')])
 
-        # 2. THE HEADERS (Dark Blue background, White BOLD text)
-        style.configure("Dash.Treeview.Heading", 
-                        background="#003366",   # Professional Navy Blue
-                        foreground="#FFFFFF",   # Bright White Text
-                        font=("Segoe UI", 22, "bold"))
-        
-        # This 'map' ensures the colors don't change when the manager clicks them
-        style.map("Dash.Treeview.Heading",
-                  background=[('active', '#004080')], # Slightly lighter blue on hover
-                  foreground=[('active', '#FFFFFF')])
-
+        # --- 2. THE TREEVIEW SETUP ---
         self.dash_tree = ttk.Treeview(self.dash, columns=("rank", "name", "wins", "diff"), 
-                                      show="headings", height=8, style="Dash.Treeview")
-        self.dash_tree.heading("rank", text="RANK")
-        self.dash_tree.heading("name", text="PLAYER / TEAM")
-        self.dash_tree.heading("wins", text="WINS")
-        self.dash_tree.heading("diff", text="+ / -")
-        
-        self.dash_tree.column("rank", width=100, anchor="center")
-        self.dash_tree.column("wins", width=150, anchor="center")
-        self.dash_tree.column("diff", width=150, anchor="center")
-        self.dash_tree.pack(fill="x", padx=50)
+                                      show="headings", height=11, style="Dash.Treeview")
 
-        # --- Live Matches Section ---
-        tk.Label(self.dash, text="📍 CURRENT LANE ASSIGNMENTS", font=("Segoe UI", 32, "bold"), 
-                 bg="#000000", fg="#00FF7F").pack(pady=30)
+        # Define the Text and Alignment for every column
+        column_data = {
+            "rank": ("Rank", 50),
+            "name": ("Player / TEAM", 100),
+            "wins": ("Wins", 50),
+            "diff": ("+/-", 50)
+        }
 
-        # 1. CREATE AND PACK THE ANNOUNCEMENT BAR FIRST (side="bottom")
-        self.dash_msg = tk.Label(self.dash, text="WELCOME!", font=("Segoe UI", 36, "bold"), 
+        for col, (label, width) in column_data.items():
+            self.dash_tree.heading(col, text=label) # THIS puts the text in the header
+            self.dash_tree.column(col, width=width, anchor="center" if col != "name" else "w")
+
+        # Use fill="both" and expand=True so it shares space with the match assignments
+        self.dash_tree.pack(fill="both", expand=True, padx=50, pady=10)
+
+        # --- 4. LIVE MATCHES SECTION ---
+        tk.Label(self.dash, text="CURRENT LANE ASSIGNMENTS", font=(main_font, 26, "bold"), 
+                 bg="#000000", fg="#00FF7F").pack(pady=20)
+
+        # Announcement bar packed at the bottom
+        self.dash_msg = tk.Label(self.dash, text="WELCOME!", font=(main_font, 36, "bold"), 
                                  bg="#c0392b", fg="white", pady=10)
         self.dash_msg.pack(side="bottom", fill="x")
 
-        # 2. THEN CREATE THE MATCH TEXT AND LET IT FILL THE REMAINING CENTER SPACE
-        self.dash_match_text = tk.Text(self.dash, font=("Segoe UI", 42, "bold"), 
+        # Match Text fills the middle gap
+        self.dash_match_text = tk.Text(self.dash, font=(main_font, 32, "bold"), 
                                       bg="#000000", fg="#FFFFFF", 
                                       relief="flat", cursor="arrow")
-        # By packing this AFTER the bottom bar, it will only fill the gap in between
         self.dash_match_text.pack(fill="both", expand=True, padx=50, pady=10)
         
-        # 3. Final call
         self.update_dashboard()
+        self.dash.after(1000, self.auto_scroll_leaderboard)
+
+    def auto_scroll_leaderboard(self):
+        if not hasattr(self, 'dash') or not self.dash.winfo_exists(): return
+        
+        all_items = self.dash_tree.get_children()
+        if not all_items: return
+
+        if not hasattr(self, 'scroll_idx'): self.scroll_idx = 0
+        
+        # Adjust this to the number of rows visible when the app starts
+        visible_rows = 11 
+
+        if self.scroll_idx < len(all_items):
+            if self.scroll_idx < visible_rows:
+                # 1. FAST-FORWARD through initially visible rows
+                self.scroll_idx += 1
+                self.dash.after(10, self.auto_scroll_leaderboard)
+            else:
+                # 2. THE CRAWL: Move row-by-row
+                self.dash_tree.see(all_items[self.scroll_idx])
+                self.scroll_idx += 1
+                
+                # Check if we JUST hit the very last row
+                if self.scroll_idx == len(all_items):
+                    # --- PAUSE AT THE BOTTOM ---
+                    # We reached the end. Wait 6 seconds so people can see the last names.
+                    self.dash.after(6000, self.auto_scroll_leaderboard)
+                else:
+                    # Regular scrolling speed
+                    self.dash.after(2000, self.auto_scroll_leaderboard)
+        else:
+            # 3. THE RESET: Snap back to the top after the pause is over
+            self.scroll_idx = 0
+            self.dash_tree.yview_moveto(0) 
+            
+            # Wait 5 seconds at the top before starting the next crawl
+            self.dash.after(5000, self.auto_scroll_leaderboard)
+
+    def reset_leaderboard(self):
+        """Jumps back to the top and restarts the scroll loop after a pause."""
+        if hasattr(self, 'dash') and self.dash.winfo_exists():
+            self.dash_tree.yview_moveto(0)
+            # Wait X milliseconds at the top so the leaders are visible
+            self.dash.after(3000, self.auto_scroll_leaderboard)
 
     def update_dashboard(self):
-        """Updates data, live clock, and announcement bar for the public display."""
         if not hasattr(self, 'dash') or not self.dash.winfo_exists():
             return
 
-        # 1. Update the Clock
-        import datetime
+        # 1. Update Clock (Always do this)
         now = datetime.datetime.now().strftime("%H:%M:%S")
         if hasattr(self, 'dash_clock'):
             self.dash_clock.config(text=now)
 
-        # 2. Update Standings Table
-        for i in self.dash_tree.get_children(): 
-            self.dash_tree.delete(i)
-            
-        conn = sqlite3.connect(self.db_path)
-        standings = conn.execute("SELECT name, wins, diff FROM players ORDER BY wins DESC, diff DESC LIMIT 10").fetchall()
-        for i, row in enumerate(standings, 1):
-            self.dash_tree.insert("", "end", values=(i, f" {row[0]}", row[1], row[2]))
+        # 2. ONLY Update Standings Table if we are at the top (pos 0.0)
+        # This prevents the "snapping" effect during auto-scroll
+        view = self.dash_tree.yview()
+        if view[0] == 0.0:
+            for i in self.dash_tree.get_children(): 
+                self.dash_tree.delete(i)
+                
+            conn = sqlite3.connect(self.db_path)
+            standings = conn.execute("SELECT name, wins, diff FROM players ORDER BY wins DESC, diff DESC").fetchall()
+            for i, row in enumerate(standings, 1):
+                self.dash_tree.insert("", "end", values=(i, f" {row[0]}", row[1], row[2]))
+            conn.close()
 
         # 3. Update Match Assignments (Massive Text)
+        # We can update this every time because it's a separate box
+        conn = sqlite3.connect(self.db_path)
         self.dash_match_text.config(state="normal")
         self.dash_match_text.delete("1.0", "end")
         matches = conn.execute("SELECT terrain, t1, t2 FROM matches WHERE status='Playing' ORDER BY terrain ASC").fetchall()
@@ -611,12 +678,11 @@ class PetanqueProMaster:
         self.dash_match_text.config(state="disabled")
         conn.close()
 
-        # 4. Update the Announcement Bar
+        # 4. Update Announcement Bar
         if hasattr(self, 'announce_entry') and hasattr(self, 'dash_msg'):
             msg = self.announce_entry.get().strip()
             self.dash_msg.config(text=msg if msg else "WELCOME TO THE TOURNAMENT!")
 
-        # 5. Refresh every 1 second (keeps clock and announcements snappy)
         self.dash.after(1000, self.update_dashboard)
 
 if __name__ == "__main__":
