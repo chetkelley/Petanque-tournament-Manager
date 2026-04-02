@@ -24,7 +24,7 @@ jobs:
 
     - name: Build with PyInstaller
         # This is your specific command with the icon and the PIL fix
-      run: pyinstaller --noconsole --onefile --hidden-import=PIL --add-data "boule icon.png;." Tournament_Manager_De.py
+      run: pyinstaller --noconsole --name Tournament_Manager --onefile --hidden-import=PIL --add-data "boule icon.png;." Tournament_Manager_De.py
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
