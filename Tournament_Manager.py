@@ -1,96 +1,429 @@
+"""
+Pétanque Pro - Tournament Director Edition
+Refactored for clean architecture, safety, and maintainability.
+"""
+
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox
 import sqlite3
 import pandas as pd
 import datetime
 import platform
 import random
 import os
-from PIL import Image, ImageTk
 import sys
+from PIL import Image, ImageTk
 
-def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+class MatchStatus:
+    PLAYING  = "Playing"
+    WAITING  = "Waiting"
+    FINISHED = "Finished"
+
+
+class TournamentMode:
+    SWISS     = "Swiss Ladder"
+    MELEE     = "Super Melee"
+    ELIM      = "Single Elimination"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def resource_path(relative_path: str) -> str:
+    """Return absolute path; works both in dev and when bundled by PyInstaller."""
     try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
+        base = sys._MEIPASS  # type: ignore[attr-defined]
+    except AttributeError:
+        base = os.path.abspath(".")
+    return os.path.join(base, relative_path)
+
+
+def split_team(team_string: str) -> list[str]:
+    """Split 'Alice, Bob & Carol' into ['Alice', 'Bob', 'Carol']."""
+    return [n.strip() for n in team_string.replace(" & ", ",").split(",")]
+
+
+# ---------------------------------------------------------------------------
+# Database Layer
+# ---------------------------------------------------------------------------
+
+class Database:
+    """All SQL lives here. The rest of the app never writes raw SQL."""
+
+    def __init__(self, path: str = "tournament.db"):
+        self.path = path
+        self._init_schema()
+
+    # -- Context manager so callers can do: with self.db as conn: ...
+    def connect(self):
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_schema(self):
+        with self.connect() as conn:
+            # Migrate existing databases that predate these columns
+            for col in ("match_id INTEGER", "terrain INTEGER"):
+                try:
+                    conn.execute(f"ALTER TABLE history ADD COLUMN {col}")
+                except Exception:
+                    pass  # Column already exists — safe to ignore
+
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS players (
+                    id   INTEGER PRIMARY KEY,
+                    name TEXT UNIQUE,
+                    wins INTEGER DEFAULT 0,
+                    pf   INTEGER DEFAULT 0,
+                    pa   INTEGER DEFAULT 0,
+                    diff INTEGER DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS matches (
+                    id      INTEGER PRIMARY KEY,
+                    t1      TEXT,
+                    t2      TEXT,
+                    terrain INTEGER,
+                    status  TEXT
+                );
+                CREATE TABLE IF NOT EXISTS history (
+                    id        INTEGER PRIMARY KEY,
+                    match_id  INTEGER,
+                    terrain   INTEGER,
+                    team_a    TEXT,
+                    team_b    TEXT,
+                    score_a   INTEGER,
+                    score_b   INTEGER,
+                    round_num INTEGER
+                );
+
+            """)
+
+    # -- Players --
+
+    def add_player(self, name: str):
+        with self.connect() as conn:
+            conn.execute("INSERT INTO players (name) VALUES (?)", (name,))
+
+    def delete_player(self, name: str):
+        with self.connect() as conn:
+            conn.execute("DELETE FROM players WHERE name=?", (name,))
+
+    def get_standings(self) -> list:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT name, wins, pf, pa, diff FROM players ORDER BY wins DESC, diff DESC"
+            ).fetchall()
+
+    def get_all_player_names(self) -> list[str]:
+        with self.connect() as conn:
+            return [r["name"] for r in conn.execute(
+                "SELECT name FROM players ORDER BY wins DESC, diff DESC"
+            ).fetchall()]
+
+    def apply_bye(self, name: str):
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE players SET wins=wins+1, pf=pf+13, diff=diff+13 WHERE name=?",
+                (name,)
+            )
+
+    def update_player_stats(self, conn, name: str, pf: int, pa: int, win: int):
+        conn.execute(
+            "UPDATE players SET pf=pf+?, pa=pa+?, wins=MAX(0,wins+?), diff=diff+? WHERE name=?",
+            (pf, pa, win, pf - pa, name)
+        )
+
+    def reverse_player_stats(self, conn, name: str, pf: int, pa: int, win: int):
+        conn.execute(
+            "UPDATE players SET pf=pf-?, pa=pa-?, wins=MAX(0,wins-?), diff=diff-? WHERE name=?",
+            (pf, pa, win, pf - pa, name)
+        )
+
+    # -- Matches --
+
+    def clear_matches(self, conn=None):
+        def _do(c):
+            c.execute("DELETE FROM matches")
+        if conn:
+            _do(conn)
+        else:
+            with self.connect() as c:
+                _do(c)
+
+    def insert_match(self, conn, t1: str, t2: str, terrain: int, status: str):
+        conn.execute(
+            "INSERT INTO matches (t1, t2, terrain, status) VALUES (?,?,?,?)",
+            (t1, t2, terrain, status)
+        )
+
+    def get_matches(self) -> list:
+        with self.connect() as conn:
+            return conn.execute("SELECT id, terrain, t1, t2, status FROM matches").fetchall()
+
+    def get_active_match(self):
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT id FROM matches WHERE status IN (?,?)",
+                (MatchStatus.PLAYING, MatchStatus.WAITING)
+            ).fetchone()
+
+    def get_playing_matches(self) -> list:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT terrain, t1, t2 FROM matches WHERE status=? ORDER BY terrain ASC",
+                (MatchStatus.PLAYING,)
+            ).fetchall()
+
+    def finish_match(self, conn, match_id: int):
+        conn.execute(
+            "UPDATE matches SET status=?, terrain=0 WHERE id=?",
+            (MatchStatus.FINISHED, match_id)
+        )
+
+    def promote_waiting(self, conn, terrain: int):
+        row = conn.execute(
+            "SELECT id FROM matches WHERE status=? LIMIT 1",
+            (MatchStatus.WAITING,)
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE matches SET status=?, terrain=? WHERE id=?",
+                (MatchStatus.PLAYING, terrain, row["id"])
+            )
+
+    def reopen_match(self, conn, match_id: int, terrain: int, status: str):
+        """Reopen a finished match by its ID — reliable, no name-matching."""
+        conn.execute(
+            "UPDATE matches SET terrain=?, status=? WHERE id=? AND status=?",
+            (terrain, status, match_id, MatchStatus.FINISHED)
+        )
+
+    def get_occupied_terrains(self, conn) -> list[int]:
+        return [r["terrain"] for r in conn.execute(
+            "SELECT terrain FROM matches WHERE status=?", (MatchStatus.PLAYING,)
+        ).fetchall()]
+
+    # -- History --
+
+    def add_history(self, conn, match_id: int, terrain: int, team_a: str, team_b: str,
+                    score_a: int, score_b: int, round_num: int):
+        conn.execute(
+            "INSERT INTO history (match_id, terrain, team_a, team_b, score_a, score_b, round_num) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (match_id, terrain, team_a, team_b, score_a, score_b, round_num)
+        )
+
+    def get_last_history(self):
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT id, match_id, terrain, team_a, team_b, score_a, score_b "
+                "FROM history ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+
+    def delete_history(self, conn, history_id: int):
+        conn.execute("DELETE FROM history WHERE id=?", (history_id,))
+
+    def played_before(self, conn, t1: str, t2: str) -> bool:
+        return conn.execute(
+            "SELECT id FROM history WHERE (team_a=? AND team_b=?) OR (team_a=? AND team_b=?)",
+            (t1, t2, t2, t1)
+        ).fetchone() is not None
+
+    def get_current_round(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute("SELECT MAX(round_num) as r FROM history").fetchone()
+            return (row["r"] or 0) + 1
+
+    # -- Bulk --
+
+    def reset_all(self):
+        with self.connect() as conn:
+            conn.executescript("DELETE FROM players; DELETE FROM matches; DELETE FROM history;")
+
+    def get_standings_df(self):
+        with self.connect() as conn:
+            return pd.read_sql_query(
+                "SELECT name AS Team, wins AS Wins, pf AS PF, pa AS PA, diff AS Diff "
+                "FROM players ORDER BY wins DESC, diff DESC", conn
+            )
+
+    def get_history_df(self):
+        with self.connect() as conn:
+            # We use SQL string concatenation to combine the scores
+            # || is the standard SQLite operator for joining strings
+            query = """
+                SELECT 
+                    round_num AS 'Round', 
+                    team_a AS 'Team 1', 
+                    team_b AS 'Team 2', 
+                    score_a || ' - ' || score_b AS 'Result'
+                FROM history
+                ORDER BY round_num ASC, id ASC
+            """
+            return pd.read_sql_query(query, conn)
+
+
+# ---------------------------------------------------------------------------
+# Tournament Engine
+# ---------------------------------------------------------------------------
+
+class TournamentEngine:
+    """Pure pairing logic — no UI, no DB writes (returns data for caller to persist)."""
+
+    @staticmethod
+    def swiss_pairs(player_names: list[str], already_played_fn) -> tuple[list, str | None]:
+        """
+        Return (pairs, bye_player_or_None).
+        pairs = [(t1, t2), ...]
+        """
+        players = list(player_names)
+        bye = None
+
+        if len(players) % 2 != 0:
+            bye = players.pop()
+
+        paired = []
+        unpaired = list(players)
+
+        while len(unpaired) >= 2:
+            t1 = unpaired.pop(0)
+            matched = False
+            for i, candidate in enumerate(unpaired):
+                if not already_played_fn(t1, candidate):
+                    paired.append((t1, unpaired.pop(i)))
+                    matched = True
+                    break
+            if not matched:
+                paired.append((t1, unpaired.pop(0)))
+
+        return paired, bye
+
+    @staticmethod
+    def melee_teams(player_names: list[str]) -> tuple[list, str | None]:
+        """
+        Return (pairs, bye_player_or_None).
+        Mixes 2v2 and 3v3 so no one is left out.
+        """
+        players = list(player_names)
+        random.shuffle(players)
+        bye = None
+
+        if len(players) % 2 != 0:
+            bye = players.pop()
+
+        matches = []
+
+        # Create 3v3 matches to handle counts that don't divide cleanly into 2v2
+        while len(players) >= 6 and len(players) % 4 != 0:
+            p = [players.pop(0) for _ in range(6)]
+            matches.append(
+                (f"{p[0]}, {p[1]} & {p[2]}", f"{p[3]}, {p[4]} & {p[5]}")
+            )
+
+        while len(players) >= 4:
+            p = [players.pop(0) for _ in range(4)]
+            matches.append((f"{p[0]} & {p[1]}", f"{p[2]} & {p[3]}"))
+
+        return matches, bye
+
+    @staticmethod
+    def elimination_bracket(player_names: list[str]) -> tuple[list, list]:
+        """
+        Return (pairs, byes).
+        Seeds bracket so highest-ranked players meet latest.
+        """
+        players = list(player_names)
+        byes = []
+
+        # Round up to next power of 2
+        target = 1
+        while target < len(players):
+            target *= 2
+
+        while len(players) < target:
+            byes.append(players.pop(0) if players else None)
+
+        # Seed: 1 vs last, 2 vs second-last, etc.
+        pairs = []
+        while len(players) >= 2:
+            pairs.append((players.pop(0), players.pop()))
+
+        return pairs, byes
+
+
+# ---------------------------------------------------------------------------
+# Main Application (UI only)
+# ---------------------------------------------------------------------------
 
 class PetanqueProMaster:
-    def __init__(self, root):
+    def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Pétanque Pro - Tournament Director Edition")
-        self.db_path = "tournament.db"
-        self.init_db()
-        
-        # 1. BUILD the UI first
-        self.setup_ui() 
-        
-        # 2. REFRESH the data only after the UI (match_list) is created
-        self.refresh_all()
+        self.root.title("Pétanque Pro — Tournament Director Edition")
 
-    def init_db(self):
-        conn = sqlite3.connect(self.db_path)
-        # Players Table
-        conn.execute('''CREATE TABLE IF NOT EXISTS players 
-                        (id INTEGER PRIMARY KEY, name TEXT UNIQUE, wins INT DEFAULT 0, 
-                         pf INT DEFAULT 0, pa INT DEFAULT 0, diff INT DEFAULT 0)''')
-        # Current Round Matches
-        conn.execute('''CREATE TABLE IF NOT EXISTS matches 
-                        (id INTEGER PRIMARY KEY, t1 TEXT, t2 TEXT, terrain INT, status TEXT)''')
-        # Enhanced Match History for Stats
-        conn.execute('''CREATE TABLE IF NOT EXISTS history 
-                        (id INTEGER PRIMARY KEY, team_a TEXT, team_b TEXT, 
-                         score_a INT, score_b INT, round_num INT)''')
-        conn.commit()
-        conn.close()
+        self.db     = Database()
+        self.engine = TournamentEngine()
 
-    def setup_ui(self):
+        # Dashboard window reference (may be None or destroyed)
+        self._dash: tk.Toplevel | None = None
+        self._dash_after_id: str | None = None   # tracks the recurring after() call
+        self._scroll_idx = 0
+
+        self._build_ui()
+        self._refresh_all()
+
+    # -----------------------------------------------------------------------
+    # UI Construction
+    # -----------------------------------------------------------------------
+
+    def _build_ui(self):
         self.tabs = ttk.Notebook(self.root)
         self.tab_standings = tk.Frame(self.tabs, padx=20, pady=20)
-        self.tab_matches = tk.Frame(self.tabs, padx=20, pady=20)
-        
+        self.tab_matches   = tk.Frame(self.tabs, padx=20, pady=20)
         self.tabs.add(self.tab_standings, text=" 1. Leaderboard ")
-        self.tabs.add(self.tab_matches, text=" 2. Live Matches & Draw ")
+        self.tabs.add(self.tab_matches,   text=" 2. Live Matches & Draw ")
         self.tabs.pack(expand=True, fill="both")
 
-        # --- TAB 1: STANDINGS & REGISTRATION ---
-        reg_frame = tk.LabelFrame(self.tab_standings, text="Tournament Management", padx=10, pady=10)
-        reg_frame.pack(fill="x", pady=5)
-        
-        # --- ROW 1: Team Entry & Buttons ---
-        row1 = tk.Frame(reg_frame)
+        self._build_standings_tab()
+        self._build_matches_tab()
+
+    def _build_standings_tab(self):
+        mgmt = tk.LabelFrame(self.tab_standings, text="Tournament Management", padx=10, pady=10)
+        mgmt.pack(fill="x", pady=5)
+
+        # Row 1 — team entry & action buttons
+        row1 = tk.Frame(mgmt)
         row1.pack(fill="x", pady=5)
 
         self.entry_name = tk.Entry(row1, width=25, font=("Arial", 12))
         self.entry_name.pack(side="left", padx=5)
-        self.entry_name.bind("<Return>", lambda e: self.add_player())
-        
-        tk.Button(row1, text="Add Team", command=self.add_player, bg="#ecf0f1").pack(side="left", padx=2)
-        tk.Button(row1, text="Delete Selected", command=self.delete_player, fg="orange").pack(side="left", padx=2)
-        
-        # Dashboard Button (The Dark Blue one)
-        tk.Button(row1, text="OPEN PUBLIC DASHBOARD", command=self.open_dashboard, 
-                  bg="#ecf0f1", fg="#00008B", font=("Arial", 10, "bold")).pack(side="right", padx=5)
+        self.entry_name.bind("<Return>", lambda _e: self._add_player())
 
-        tk.Button(row1, text="EXPORT TO EXCEL", command=self.export_to_excel, bg="#27ae60", fg="black").pack(side="right", padx=5)
-        tk.Button(row1, text="RESET DATA", fg="red", command=self.reset_tournament).pack(side="right")
+        tk.Button(row1, text="Add Team",       command=self._add_player,    bg="#ecf0f1").pack(side="left", padx=2)
+        tk.Button(row1, text="Delete Selected",command=self._delete_player, fg="orange" ).pack(side="left", padx=2)
 
-        # --- ROW 2: Announcement Bar (Now Below) ---
-        row2 = tk.Frame(reg_frame)
-        row2.pack(fill="x", pady=(10, 0)) # Add a little top padding to separate it
+        tk.Button(row1, text="RESET DATA",          fg="red",     command=self._reset_tournament ).pack(side="right", padx=2)
+        tk.Button(row1, text="EXPORT TO EXCEL",      bg="#27ae60", command=self._export_to_excel  ).pack(side="right", padx=5)
+        tk.Button(row1, text="OPEN PUBLIC DASHBOARD",bg="#ecf0f1", fg="#00008B",
+                  font=("Arial", 10, "bold"),        command=self._open_dashboard              ).pack(side="right", padx=5)
 
-        tk.Label(row2, text="📢 BOARDCAST MESSAGE:", font=("Arial", 10, "bold")).pack(side="left", padx=5)
+        # Row 2 — broadcast message
+        row2 = tk.Frame(mgmt)
+        row2.pack(fill="x", pady=(10, 0))
+
+        tk.Label(row2, text="📢 BROADCAST MESSAGE:", font=("Arial", 10, "bold")).pack(side="left", padx=5)
         self.announce_entry = tk.Entry(row2, font=("Arial", 12), fg="blue")
         self.announce_entry.pack(side="left", fill="x", expand=True, padx=10)
         self.announce_entry.insert(0, "Welcome to the Tournament!")
-        
-        # Let her press Enter in this box to update the dashboard immediately
-        self.announce_entry.bind("<Return>", lambda e: self.update_dashboard())
-        
-        tk.Label(row2, text="(Press Enter to Update)", font=("Arial", 8), fg="gray").pack(side="left")
+        self.announce_entry.bind("<Return>", lambda _e: self._update_dashboard())
+        tk.Label(row2, text="(Press Enter to update dashboard)", font=("Arial", 8), fg="gray").pack(side="left")
 
+        # Standings treeview
         cols = ("Rank", "Team Name", "Wins", "Points For", "Points Against", "Net Diff")
         self.tree = ttk.Treeview(self.tab_standings, columns=cols, show="headings")
         for col in cols:
@@ -98,598 +431,568 @@ class PetanqueProMaster:
             self.tree.column(col, anchor="center", width=120)
         self.tree.pack(expand=True, fill="both", pady=10)
 
-     # --- TAB 2: MATCHES & DRAW ---
-        ctrl_frame = tk.LabelFrame(self.tab_matches, text="Tournament Control", padx=5, pady=5)
-        ctrl_frame.pack(fill="x")
-        
-        # Column 0-1: Lanes (Terrains)
-        tk.Label(ctrl_frame, text="Lanes:").grid(row=0, column=0, padx=2)
-        self.terrain_count = tk.Entry(ctrl_frame, width=3)
-        self.terrain_count.insert(0, "3") 
+    def _build_matches_tab(self):
+        ctrl = tk.LabelFrame(self.tab_matches, text="Tournament Control", padx=5, pady=5)
+        ctrl.pack(fill="x")
+
+        tk.Label(ctrl, text="Lanes:").grid(row=0, column=0, padx=2)
+        self.terrain_count = tk.Entry(ctrl, width=3)
+        self.terrain_count.insert(0, "3")
         self.terrain_count.grid(row=0, column=1, padx=2)
-        
-        # Column 2-3: System Dropdown
-        tk.Label(ctrl_frame, text="System:").grid(row=0, column=2, padx=5)
-        self.tourney_type = ttk.Combobox(ctrl_frame, 
-                                         values=["Swiss Ladder", "Super Melee", "Single Elimination"], 
-                                         state="readonly", width=12)
-        self.tourney_type.set("Swiss Ladder")
+
+        tk.Label(ctrl, text="System:").grid(row=0, column=2, padx=5)
+        self.tourney_type = ttk.Combobox(
+            ctrl,
+            values=[TournamentMode.SWISS, TournamentMode.MELEE, TournamentMode.ELIM],
+            state="readonly", width=16
+        )
+        self.tourney_type.set(TournamentMode.SWISS)
         self.tourney_type.grid(row=0, column=3, padx=2)
-        
-        # Column 4: Generate (Blue-ish)
-        tk.Button(ctrl_frame, text="GENERATE", command=self.handle_draw_logic, 
+
+        tk.Button(ctrl, text="GENERATE",  command=self._handle_draw,
                   bg="#3498db", fg="black", font=("Arial", 10, "bold")).grid(row=0, column=4, padx=5)
-
-        # Column 5: Undo (Orange-ish)
-        tk.Button(ctrl_frame, text="UNDO LAST", command=self.undo_last_score, 
+        tk.Button(ctrl, text="UNDO LAST", command=self._undo_last_score,
                   bg="#f39c12", fg="black").grid(row=0, column=5, padx=5)
-        
-        # Column 6: Hint Label
-        tk.Label(ctrl_frame, text="(Double-click to score)", fg="gray", font=("Arial", 9)).grid(row=0, column=6, padx=5)
+        tk.Label(ctrl, text="(Double-click match to enter score)",
+                 fg="gray", font=("Arial", 9)).grid(row=0, column=6, padx=5)
 
-        # --- THE MATCH LIST (This MUST be named self.match_list) ---
-        self.match_list = ttk.Treeview(self.tab_matches, columns=("id", "t", "t1", "vs", "t2", "status"), show="headings")
-        
-        # Define Columns
-        self.match_list.heading("id", text="ID")
-        self.match_list.heading("t", text="Lanes")
-        self.match_list.heading("t1", text="Team 1")
-        self.match_list.heading("vs", text="vs")
-        self.match_list.heading("t2", text="Team 2")
-        self.match_list.heading("status", text="Status")
-        
-        # Set Widths
-        self.match_list.column("id", width=40, anchor="center")
-        self.match_list.column("t", width=60, anchor="center")
-        self.match_list.column("t1", width=200, anchor="center")
-        self.match_list.column("vs", width=40, anchor="center")
-        self.match_list.column("t2", width=200, anchor="center")
-        self.match_list.column("status", width=100, anchor="center")
-        
+        # Match list (single definition — no duplicates)
+        cols = ("id", "lane", "t1", "vs", "t2", "status")
+        self.match_list = ttk.Treeview(self.tab_matches, columns=cols, show="headings")
+
+        headers = {"id": ("ID", 40), "lane": ("Lane", 60), "t1": ("Team 1", 200),
+                   "vs": ("vs", 40), "t2": ("Team 2", 200), "status": ("Status", 100)}
+        for col, (label, width) in headers.items():
+            self.match_list.heading(col, text=label)
+            self.match_list.column(col, width=width,
+                                   anchor="center" if col != "t1" else "center")
+
         self.match_list.pack(fill="both", expand=True, pady=10)
-        self.match_list.bind("<Double-1>", self.on_match_double_click)
-        
-        # Column 0-1: Terrains
-        tk.Label(ctrl_frame, text="Lanes:").grid(row=0, column=0, padx=2)
-        self.terrain_count = tk.Entry(ctrl_frame, width=3)
-        self.terrain_count.insert(0, "3") 
-        self.terrain_count.grid(row=0, column=1, padx=2)
-        
-        # Column 2-3: System
-        tk.Label(ctrl_frame, text="System:").grid(row=0, column=2, padx=5)
-        self.tourney_type = ttk.Combobox(ctrl_frame, 
-                                         values=["Swiss Ladder", "Super Melee", "Single Elimination"], 
-                                         state="readonly", width=12)
-        self.tourney_type.set("Swiss Ladder")
-        self.tourney_type.grid(row=0, column=3, padx=2)
-        
-        # Column 4: Generate (Blue)
-        tk.Button(ctrl_frame, text="GENERATE", command=self.handle_draw_logic, 
-                  bg="#3498db", fg="black", font=("Arial", 10, "bold")).grid(row=0, column=4, padx=5)
+        self.match_list.bind("<Double-1>", self._on_match_double_click)
 
-        # Column 5: Undo (Orange)
-        tk.Button(ctrl_frame, text="UNDO LAST", command=self.undo_last_score, 
-                  bg="#f39c12", fg="black").grid(row=0, column=5, padx=5)
-        
-        # Column 6: Shortened Hint
-        tk.Label(ctrl_frame, text="(Double-click to score)", fg="gray", font=("Arial", 9)).grid(row=0, column=6, padx=5)
+    # -----------------------------------------------------------------------
+    # Refresh
+    # -----------------------------------------------------------------------
 
-    # --- LOGIC ---
+    def _refresh_all(self):
+        # Standings
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        for i, p in enumerate(self.db.get_standings(), 1):
+            self.tree.insert("", "end", values=(i, p["name"], p["wins"], p["pf"], p["pa"], p["diff"]))
 
-    def add_player(self):
+        # Matches
+        for row in self.match_list.get_children():
+            self.match_list.delete(row)
+        for m in self.db.get_matches():
+            lane = m["terrain"] if m["terrain"] > 0 else "-"
+            self.match_list.insert("", "end",
+                values=(m["id"], lane, m["t1"], "vs", m["t2"], m["status"]))
+
+        # Push to dashboard if open
+        if self._dash_is_alive():
+            self._update_dashboard()
+
+    # -----------------------------------------------------------------------
+    # Player management
+    # -----------------------------------------------------------------------
+
+    def _add_player(self):
         name = self.entry_name.get().strip()
-        if name:
-            conn = sqlite3.connect(self.db_path)
-            try:
-                conn.execute("INSERT INTO players (name) VALUES (?)", (name,))
-                conn.commit()
-                self.entry_name.delete(0, tk.END)
-                self.refresh_all()
-            except: messagebox.showerror("Error", "Team already exists.")
-            conn.close()
-    def delete_player(self):
-        """Removes the highlighted player from the standings."""
-        selected_item = self.tree.selection()
-        if not selected_item:
-            messagebox.showwarning("Selection Error", "Please click a name in the list first to select them.")
+        if not name:
             return
-        
-        # Get the name from the second column (index 1) of the treeview
-        player_name = self.tree.item(selected_item)['values'][1]
-        
-        if messagebox.askyesno("Confirm Delete", f"Remove '{player_name}' from the tournament?"):
-            conn = sqlite3.connect(self.db_path)
-            conn.execute("DELETE FROM players WHERE name=?", (player_name,))
-            conn.commit()
-            conn.close()
-            self.refresh_all()
+        try:
+            self.db.add_player(name)
+            self.entry_name.delete(0, tk.END)
+            self._refresh_all()
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Error", f"Team '{name}' already exists.")
 
-    def generate_swiss_draw(self):
-        conn = sqlite3.connect(self.db_path)
-        players = [row[0] for row in conn.execute("SELECT name FROM players ORDER BY wins DESC, diff DESC").fetchall()]
-        
-        if len(players) < 2:
+    def _delete_player(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("Selection Error", "Please select a team first.")
+            return
+        name = self.tree.item(selected)["values"][1]
+        if messagebox.askyesno("Confirm Delete", f"Remove '{name}' from the tournament?"):
+            self.db.delete_player(name)
+            self._refresh_all()
+
+    # -----------------------------------------------------------------------
+    # Draw / Pairing
+    # -----------------------------------------------------------------------
+
+    def _handle_draw(self):
+        mode = self.tourney_type.get()
+        dispatch = {
+            TournamentMode.SWISS: self._generate_swiss,
+            TournamentMode.MELEE: self._generate_melee,
+            TournamentMode.ELIM:  self._generate_elimination,
+        }
+        dispatch[mode]()
+
+    def _check_active_round(self) -> bool:
+        """Returns True if it is safe to proceed (no active round, or user confirmed override)."""
+        if self.db.get_active_match():
+            return messagebox.askyesno(
+                "Round In Progress",
+                "A round is currently active. Generating a new draw will clear current matches. Continue?"
+            )
+        return True
+
+    def _max_terrains(self) -> int:
+        try:
+            return int(self.terrain_count.get())
+        except ValueError:
+            return 3
+
+    def _assign_terrains(self, conn, pairs: list[tuple[str, str]]):
+        """Insert match rows, assigning terrains to the first N matches."""
+        max_t = self._max_terrains()
+        for i, (t1, t2) in enumerate(pairs, 1):
+            if i <= max_t:
+                self.db.insert_match(conn, t1, t2, i, MatchStatus.PLAYING)
+            else:
+                self.db.insert_match(conn, t1, t2, 0, MatchStatus.WAITING)
+
+    def _generate_swiss(self):
+        names = self.db.get_all_player_names()
+        if len(names) < 2:
             messagebox.showwarning("Warning", "Need at least 2 teams!")
             return
+        if not self._check_active_round():
+            return
 
-        # Check for unfinished matches
-        active = conn.execute("SELECT id FROM matches WHERE status='Playing' OR status='Waiting'").fetchone()
-        if active:
-            if not messagebox.askyesno("Warning", "A round is currently in progress. Generating a new one will wipe current matches. Continue?"):
-                return
+        with self.db.connect() as conn:
+            def played(a, b): return self.db.played_before(conn, a, b)
+            pairs, bye = self.engine.swiss_pairs(names, played)
 
-        def played_before(t1, t2):
-            res = conn.execute("SELECT id FROM history WHERE (team_a=? AND team_b=?) OR (team_a=? AND team_b=?)", (t1, t2, t2, t1)).fetchone()
-            return res is not None
+            if bye:
+                self.db.clear_matches(conn)
+                conn.execute(
+                    "UPDATE players SET wins=wins+1, pf=pf+13, diff=diff+13 WHERE name=?", (bye,)
+                )
+                messagebox.showinfo("BYE", f"{bye} receives a BYE (13–0 win).")
+            else:
+                self.db.clear_matches(conn)
 
-        paired = []
-        unpaired = list(players)
-        
-        # Swiss Pairing Logic
-        while len(unpaired) >= 2:
-            t1 = unpaired.pop(0)
-            partner_found = False
-            for i in range(len(unpaired)):
-                if not played_before(t1, unpaired[i]):
-                    paired.append((t1, unpaired.pop(i)))
-                    partner_found = True
-                    break
-            if not partner_found:
-                paired.append((t1, unpaired.pop(0)))
+            self._assign_terrains(conn, pairs)
 
-        if unpaired: # Handle Bye
-            bye_team = unpaired[0]
-            conn.execute("UPDATE players SET wins=wins+1, pf=pf+13, diff=diff+13 WHERE name=?", (bye_team,))
-            messagebox.showinfo("BYE", f"{bye_team} gets a BYE (13-0 win)")
+        self._refresh_all()
 
-        conn.execute("DELETE FROM matches")
-        max_t = int(self.terrain_count.get())
-        for i, (p1, p2) in enumerate(paired, 1):
-            status = "Playing" if i <= max_t else "Waiting"
-            terr = i if status == "Playing" else 0
-            conn.execute("INSERT INTO matches (t1, t2, terrain, status) VALUES (?,?,?,?)", (p1, p2, terr, status))
-        
-        conn.commit()
-        conn.close()
-        self.refresh_all()
+    def _generate_melee(self):
+        names = self.db.get_all_player_names()
+        if len(names) < 4:
+            messagebox.showwarning("Warning", "Need at least 4 players!")
+            return
+        if not self._check_active_round():
+            return
 
-    def on_match_double_click(self, event):
-        item = self.match_list.selection()[0]
-        val = self.match_list.item(item, "values")
-        if val[5] != "Playing": return
+        pairs, bye = self.engine.melee_teams(names)
+
+        with self.db.connect() as conn:
+            self.db.clear_matches(conn)
+            if bye:
+                conn.execute(
+                    "UPDATE players SET wins=wins+1, pf=pf+13, diff=diff+13 WHERE name=?", (bye,)
+                )
+                messagebox.showinfo("BYE", f"{bye} receives a BYE.")
+            self._assign_terrains(conn, pairs)
+
+        self._refresh_all()
+
+    def _generate_elimination(self):
+        names = self.db.get_all_player_names()
+        if len(names) < 2:
+            messagebox.showwarning("Warning", "Need at least 2 teams!")
+            return
+        if not self._check_active_round():
+            return
+
+        pairs, byes = self.engine.elimination_bracket(names)
+
+        with self.db.connect() as conn:
+            self.db.clear_matches(conn)
+            round_num = self.db.get_current_round()
+            for bye in byes:
+                if bye:
+                    conn.execute(
+                        "UPDATE players SET wins=wins+1, pf=pf+13, diff=diff+13 WHERE name=?", (bye,)
+                    )
+                    self.db.add_history(conn, bye, "BYE", 13, 0, round_num)
+            self._assign_terrains(conn, pairs)
+
+        if byes:
+            names_str = ", ".join(b for b in byes if b)
+            messagebox.showinfo("BYE", f"First-round byes: {names_str}")
+
+        self._refresh_all()
+
+    # -----------------------------------------------------------------------
+    # Scoring
+    # -----------------------------------------------------------------------
+
+    def _on_match_double_click(self, _event):
+        selection = self.match_list.selection()
+        if not selection:
+            return
+        val = self.match_list.item(selection[0], "values")
+        # val: (id, lane, t1, "vs", t2, status)
+        if val[5] != MatchStatus.PLAYING:
+            return
 
         pop = tk.Toplevel(self.root)
         pop.title("Score Entry")
         pop.geometry("300x180")
-        
-        tk.Label(pop, text=f"{val[2]} vs {val[4]}", font=("Arial", 10, "bold")).pack(pady=10)
-        e = tk.Entry(pop, font=("Arial", 14), justify="center")
-        e.insert(0, "13-0")
-        e.pack(pady=5)
-        e.focus_set()
-        e.selection_range(0, tk.END)
+        pop.grab_set()
+
+        tk.Label(pop, text=f"{val[2]}  vs  {val[4]}", font=("Arial", 10, "bold")).pack(pady=10)
+        entry = tk.Entry(pop, font=("Arial", 14), justify="center")
+        entry.insert(0, "13-0")
+        entry.pack(pady=5)
+        entry.focus_set()
+        entry.selection_range(0, tk.END)
 
         def save():
             try:
-                s1, s2 = map(int, e.get().split("-"))
-                self.record_score(val[0], val[1], val[2], val[4], s1, s2)
+                raw = entry.get().replace(" ", "")
+                s1, s2 = map(int, raw.split("-"))
+                self._record_score(int(val[0]), int(val[1]), val[2], val[4], s1, s2)
                 pop.destroy()
-            except: messagebox.showerror("Error", "Use format 13-5")
+            except (ValueError, AttributeError):
+                messagebox.showerror("Format Error", "Use format  13-5", parent=pop)
 
-        e.bind("<Return>", lambda ev: save())
+        entry.bind("<Return>", lambda _e: save())
         tk.Button(pop, text="Save (Enter)", command=save, bg="#2ecc71").pack(pady=10)
 
-    def record_score(self, m_id, terrain, t1, t2, s1, s2):
-        conn = sqlite3.connect(self.db_path)
-        
-        # Helper to split "John, Sarah & Robert" into ['John', 'Sarah', 'Robert']
-        def get_individuals(team_string):
-            # Replace '&' with ',' then split by ','
-            names = team_string.replace(' & ', ',').split(',')
-            return [n.strip() for n in names]
+    def _record_score(self, match_id: int, terrain: int,
+                      t1: str, t2: str, s1: int, s2: int):
+        round_num = self.db.get_current_round()
+        with self.db.connect() as conn:
+            # Update individual player stats
+            for name in split_team(t1):
+                self.db.update_player_stats(conn, name, s1, s2, 1 if s1 > s2 else 0)
+            for name in split_team(t2):
+                self.db.update_player_stats(conn, name, s2, s1, 1 if s2 > s1 else 0)
 
-        players_t1 = get_individuals(t1)
-        players_t2 = get_individuals(t2)
+            # Record history — store terrain so undo can restore the exact lane
+            self.db.add_history(conn, match_id, terrain, t1, t2, s1, s2, round_num)
 
-        # 1. Update Every Individual in Team 1
-        for name in players_t1:
-            conn.execute("""UPDATE players SET pf=pf+?, pa=pa+?, wins=wins+?, diff=diff+? 
-                            WHERE name=?""", 
-                         (s1, s2, (1 if s1 > s2 else 0), (s1 - s2), name))
-        
-        # 2. Update Every Individual in Team 2
-        for name in players_t2:
-            conn.execute("""UPDATE players SET pf=pf+?, pa=pa+?, wins=wins+?, diff=diff+? 
-                            WHERE name=?""", 
-                         (s2, s1, (1 if s2 > s1 else 0), (s2 - s1), name))
-        
-        # 3. Add to Statistical History (The Manager's Excel Data)
-        conn.execute("INSERT INTO history (team_a, team_b, score_a, score_b) VALUES (?,?,?,?)", 
-                     (t1, t2, s1, s2))
-        
-        # 4. Handle Terrain Queue
-        conn.execute("UPDATE matches SET status='Finished', terrain=0 WHERE id=?", (m_id,))
-        waiting = conn.execute("SELECT id FROM matches WHERE status='Waiting' LIMIT 1").fetchone()
-        if waiting:
-            conn.execute("UPDATE matches SET status='Playing', terrain=? WHERE id=?", (terrain, waiting[0]))
-        
-        conn.commit()
-        conn.close()
-        self.refresh_all()
+            # Mark match finished and promote next waiting match to this terrain
+            self.db.finish_match(conn, match_id)
+            self.db.promote_waiting(conn, terrain)
 
-    def export_to_excel(self):
-        try:
-            conn = sqlite3.connect(self.db_path)
-            # Standings Sheet
-            df_standings = pd.read_sql_query("SELECT name as Team, wins as Wins, pf as PF, pa as PA, diff as Diff FROM players ORDER BY wins DESC, diff DESC", conn)
-            # History Sheet
-            df_history = pd.read_sql_query("SELECT team_a as 'Team 1', score_a as 'Score 1', score_b as 'Score 2', team_b as 'Team 2' FROM history", conn)
-            
-            with pd.ExcelWriter("Tournament_Results.xlsx", engine="openpyxl") as writer:
-                df_standings.to_excel(writer, sheet_name="Final Rankings", index=False)
-                df_history.to_excel(writer, sheet_name="Match History", index=False)
-            
-            conn.close()
-            messagebox.showinfo("Export Success", f"Saved to {os.path.abspath('Tournament_Results.xlsx')}")
-        except Exception as e:
-            messagebox.showerror("Export Error", f"Check if Excel file is already open!\nError: {e}")
+        self._refresh_all()
 
-    def reset_tournament(self):
-        if messagebox.askyesno("Confirm", "Wipe EVERYTHING?"):
-            conn = sqlite3.connect(self.db_path)
-            conn.execute("DELETE FROM players"); conn.execute("DELETE FROM matches"); conn.execute("DELETE FROM history")
-            conn.commit(); conn.close(); self.refresh_all()
+    # -----------------------------------------------------------------------
+    # Undo
+    # -----------------------------------------------------------------------
 
-    def refresh_all(self):
-        conn = sqlite3.connect(self.db_path)
-        for i in self.tree.get_children(): self.tree.delete(i)
-        players = conn.execute("SELECT name, wins, pf, pa, diff FROM players ORDER BY wins DESC, diff DESC").fetchall()
-        for i, p in enumerate(players, 1):
-            self.tree.insert("", "end", values=(i, p[0], p[1], p[2], p[3], p[4]))
-            
-        for i in self.match_list.get_children(): self.match_list.delete(i)
-        matches = conn.execute("SELECT id, terrain, t1, 'vs', t2, status FROM matches").fetchall()
-        for m in matches:
-            t_disp = m[1] if m[1] > 0 else "-"
-            self.match_list.insert("", "end", values=(m[0], t_disp, m[2], m[3], m[4], m[5]))
-        conn.close()
-        if hasattr(self, 'dash') and self.dash.winfo_exists():
-            self.update_dashboard()
-
-    def handle_draw_logic(self):
-        """This function checks the dropdown and picks the right math."""
-        mode = self.tourney_type.get()
-        if mode == "Swiss Ladder":
-            self.generate_swiss_draw()
-        elif mode == "Super Melee":
-            self.generate_super_melee()
-        elif mode == "Single Elimination":
-            self.generate_elimination_draw()
-
-    def generate_super_melee(self):
-        """Universal Melee: Actually mixes 2v2 and 3v3 so NO ONE is left out."""
-        conn = sqlite3.connect(self.db_path)
-        players = [row[0] for row in conn.execute("SELECT name FROM players").fetchall()]
-        random.shuffle(players)
-        
-        count = len(players)
-        if count < 4:
-            messagebox.showwarning("Warning", "Need at least 4 players!")
-            return
-
-        conn.execute("DELETE FROM matches")
-        max_t = int(self.terrain_count.get())
-        temp_players = list(players)
-        
-        # 1. Handle the "Bye" if total is odd (e.g. 11, 13, 15)
-        if count % 2 != 0:
-            bye_player = temp_players.pop()
-            conn.execute("UPDATE players SET wins=wins+1, pf=pf+13, diff=diff+13 WHERE name=?", (bye_player,))
-            messagebox.showinfo("Bye", f"{bye_player} receives a BYE.")
-
-        matches_to_create = []
-        
-        # 2. Logic to pivot to 3v3 if the remainder is awkward
-        # This loop runs only if we have enough for a 3v3 AND the remaining count 
-        # isn't a clean multiple of 4.
-        while len(temp_players) >= 6 and (len(temp_players) % 4 != 0):
-            p = [temp_players.pop(0) for _ in range(6)]
-            matches_to_create.append((f"{p[0]}, {p[1]} & {p[2]}", f"{p[3]}, {p[4]} & {p[5]}"))
-
-        # 3. Create standard 2v2 Matches with everything else
-        while len(temp_players) >= 4:
-            p = [temp_players.pop(0) for _ in range(4)]
-            matches_to_create.append((f"{p[0]} & {p[1]}", f"{p[2]} & {p[3]}"))
-
-        # 4. Save to Database
-        for i, (team_a, team_b) in enumerate(matches_to_create, 1):
-            status = "Playing" if i <= max_t else "Waiting"
-            terr = i if status == "Playing" else 0
-            conn.execute("INSERT INTO matches (t1, t2, terrain, status) VALUES (?,?,?,?)", 
-                         (team_a, team_b, terr, status))
-        
-        conn.commit()
-        conn.close()
-        self.refresh_all()
-
-    def undo_last_score(self):
-        """Reverses the last result and reverts the existing match to 'Playing' status."""
-        conn = sqlite3.connect(self.db_path)
+    def _undo_last_score(self):
+        """Reverses the last result and restores the match to its original terrain."""
+        # Connect using the correct path from your Database class
+        conn = sqlite3.connect(self.db.path) 
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        
-        # 1. Pull the last entry from history
-        last_match = cursor.execute("SELECT id, team_a, team_b, score_a, score_b FROM history ORDER BY id DESC LIMIT 1").fetchone()
-        
+    
+        # 1. Pull the last entry from history (including the terrain it was played on)
+        last_match = cursor.execute(
+            "SELECT id, match_id, terrain, team_a, team_b, score_a, score_b FROM history ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    
         if not last_match:
             messagebox.showinfo("Undo", "No match history found to undo.")
             conn.close()
             return
 
-        h_id, t1_str, t2_str, s1, s2 = last_match
-        if not messagebox.askyesno("Confirm Undo", f"Undo result: {t1_str} ({s1}) vs {t2_str} ({s2})?"):
-            conn.close()
-            return
+        h_id = last_match['id']
+        orig_terrain = last_match['terrain']
+        t1_str = last_match['team_a']
+        t2_str = last_match['team_b']
+        s1 = last_match['score_a']
+        s2 = last_match['score_b']
 
-        # Helper to handle 'Team A & Team B' naming
+        if not messagebox.askyesno("Confirm Undo", f"Undo result: {t1_str} ({s1}) vs {t2_str} ({s2})?"):
+           conn.close()
+           return
+
+        # 2. Reverse the Stats for individuals
         def get_individuals(name_str):
-            return [n.strip() for n in name_str.replace(' & ', ',').split(',')]
+           return [n.strip() for n in name_str.replace(' & ', ',').split(',')]
 
         p1, p2 = get_individuals(t1_str), get_individuals(t2_str)
 
-        # 2. Reverse the Stats for all individuals in the teams
         for n in p1:
-            cursor.execute("UPDATE players SET pf=pf-?, pa=pa-?, wins=wins-?, diff=diff-? WHERE name=?", 
-                         (s1, s2, (1 if s1 > s2 else 0), (s1 - s2), n))
+           win_val = 1 if s1 > s2 else 0
+           cursor.execute("UPDATE players SET pf=pf-?, pa=pa-?, wins=MAX(0, wins-?), diff=diff-? WHERE name=?", 
+                         (s1, s2, win_val, (s1 - s2), n))
         for n in p2:
-            cursor.execute("UPDATE players SET pf=pf-?, pa=pa-?, wins=wins-?, diff=diff-? WHERE name=?", 
-                         (s2, s1, (1 if s2 > s1 else 0), (s2 - s1), n))
+           win_val = 1 if s2 > s1 else 0
+           cursor.execute("UPDATE players SET pf=pf-?, pa=pa-?, wins=MAX(0, wins-?), diff=diff-? WHERE name=?", 
+                         (s2, s1, win_val, (s2 - s1), n))
 
-        # 3. Find a Free Terrain for the reverted match
-        max_t = int(self.terrain_count.get())
-        occupied = [r[0] for r in cursor.execute("SELECT terrain FROM matches WHERE status='Playing'").fetchall()]
+        # 3. Handle Lane Displacement
+        # Check if another match has already moved onto the original terrain
+        occupant = cursor.execute("SELECT id, t1, t2 FROM matches WHERE terrain=? AND status=?", 
+                                (orig_terrain, MatchStatus.PLAYING)).fetchone()
         
-        assigned_terrain = 0
-        new_status = "Waiting"
-        
-        for t in range(1, max_t + 1):
-            if t not in occupied:
-                assigned_terrain = t
-                new_status = "Playing"
-                break
+        if occupant:
+            # If the lane is now taken, move the current occupant back to Waiting
+            cursor.execute("UPDATE matches SET terrain=0, status=? WHERE id=?", 
+                          (MatchStatus.WAITING, occupant['id']))
 
-        # 4. THE FIX: Update the EXISTING match instead of Inserting a new one
-        # We look for the match involving these teams that is currently 'Finished'
+        # 4. Restore the original match to the original terrain
         cursor.execute("""
             UPDATE matches 
             SET terrain = ?, status = ? 
             WHERE ((t1 = ? AND t2 = ?) OR (t1 = ? AND t2 = ?)) 
-            AND status = 'Finished'
-        """, (assigned_terrain, new_status, t1_str, t2_str, t2_str, t1_str))
+            AND status = ?
+        """, (orig_terrain, MatchStatus.PLAYING, t1_str, t2_str, t2_str, t1_str, MatchStatus.FINISHED))
 
         # 5. Clean up history
         cursor.execute("DELETE FROM history WHERE id=?", (h_id,))
-        
+
         conn.commit()
         conn.close()
-        self.refresh_all()
-        
-        msg = f"Reversed! Match is back on Terrain {assigned_terrain}." if assigned_terrain > 0 else "Reversed! Match moved to Waiting list."
-        messagebox.showinfo("Success", msg)
 
-    def open_dashboard(self):
-        self.dash = tk.Toplevel(self.root)
-        self.dash.title("OFFICIAL TOURNAMENT SCOREBOARD")
-        self.dash.state('zoomed') 
-        self.dash.configure(bg="#000000") 
+        # Refresh the UI
+        self._refresh_all()
+        messagebox.showinfo("Success", f"Restored {t1_str} vs {t2_str} to Lane {orig_terrain}.")
 
-        # --- 1. OS DETECTION & THEMING (Done ONCE) ---
-        current_os = platform.system()
-        style = ttk.Style()
+    # -----------------------------------------------------------------------
+    # Export
+    # -----------------------------------------------------------------------
 
-        if current_os == "Darwin":  # macOS
-            style.theme_use("aqua")
-            main_font = "Helvetica Neue"
-            header_bg = "#003366" # Deep Navy Blue for contrast
-            header_fg = "#003366" # Pure White Text
-            row_h = 60
-        else:  # Windows
-            style.theme_use("clam")
-            main_font = "Segoe UI"
-            header_bg = "#003366"
-            header_fg = "#FFFFFF"
-            row_h = 50
-
-        style.configure("Dash.Treeview", 
-                        background="#1a1a1a", 
-                        foreground="white", 
-                        fieldbackground="#1a1a1a", 
-                        font=(main_font, 32), 
-                        rowheight=row_h)
-        
-        # --- THE FIX FOR WHITE-ON-WHITE HEADERS ---
-        style.configure("Dash.Treeview.Heading", 
-                        background=header_bg, 
-                        foreground=header_fg, 
-                        font=(main_font, 22, "bold"))
-
-        # Mac 'Aqua' theme is stubborn. We must 'map' the background 
-        # to ensure it stays dark even when clicked or hovered.
-        style.map("Dash.Treeview.Heading",
-                  background=[('active', header_bg), ('!disabled', header_bg)],
-                  foreground=[('active', header_fg), ('!disabled', header_fg)])
-            
-        # --- 2. HEADER SECTION ---
-        header_frame = tk.Frame(self.dash, bg="#000000")
-        header_frame.pack(fill="x", pady=20)
-        
-        # Note: No quotes around main_font here!
-        tk.Label(header_frame, text="🏆 LEADERBOARD", font=(main_font, 28, "bold"), 
-                 bg="#000000", fg="#FFD700").pack(side="left", padx=50)
-        
-        # Right Side: Icon and Clock
-        right_container = tk.Frame(header_frame, bg="#000000")
-        right_container.pack(side="right", padx=50)
-
-        # 1. THE ICON (Placed first so it's on the far right)
+    def _export_to_excel(self):
         try:
-            from PIL import Image, ImageTk
-            img_path = resource_path("boule icon.png") 
-            img = Image.open(img_path)
-            img = img.resize((80, 80), Image.Resampling.LANCZOS)
-            
-            photo = ImageTk.PhotoImage(img)
-            icon_label = tk.Label(right_container, image=photo, bg="#000000")
-            icon_label.image = photo # Keep reference!
-            icon_label.pack(side="right", padx=10)
-        except Exception as e:
-            print(f"Icon error: {e}")
+            out = "Tournament_Results.xlsx"
+            with pd.ExcelWriter(out, engine="openpyxl") as writer:
+                self.db.get_standings_df().to_excel(writer, sheet_name="Final Rankings", index=False)
+                self.db.get_history_df().to_excel(writer, sheet_name="Match History",   index=False)
+            messagebox.showinfo("Export Success", f"Saved to:\n{os.path.abspath(out)}")
+        except PermissionError:
+            messagebox.showerror("Export Error", "Close the Excel file first, then try again.")
+        except Exception as exc:
+            messagebox.showerror("Export Error", str(exc))
 
-        # 2. THE CLOCK (Placed to the left of the icon)
-        self.dash_clock = tk.Label(right_container, text="", font=("Consolas", 24), 
-                                   bg="#000000", fg="#00FF00")
-        self.dash_clock.pack(side="right", padx=20)
+    # -----------------------------------------------------------------------
+    # Reset
+    # -----------------------------------------------------------------------
 
-        # --- 3. STANDINGS TABLE ---
-        # --- 1. THE STYLE FIX (Add this where you define your styles) ---
-        # This prevents the text from turning black when you click away
-        style.map("Dash.Treeview", 
-                  foreground=[('selected', 'white'), ('!disabled', 'white')],
-                  background=[('selected', '#34495e'), ('!disabled', '#1a1a1a')])
+    def _reset_tournament(self):
+        if messagebox.askyesno("Confirm Reset", "Wipe ALL players, matches, and history?"):
+            self.db.reset_all()
+            self._refresh_all()
 
-        # --- 2. THE TREEVIEW SETUP ---
-        self.dash_tree = ttk.Treeview(self.dash, columns=("rank", "name", "wins", "diff"), 
-                                      show="headings", height=11, style="Dash.Treeview")
+    # -----------------------------------------------------------------------
+    # Dashboard
+    # -----------------------------------------------------------------------
 
-        # Define the Text and Alignment for every column
-        column_data = {
-            "rank": ("Rank", 50),
-            "name": ("Player / TEAM", 100),
-            "wins": ("Wins", 50),
-            "diff": ("+/-", 50)
-        }
+    def _dash_is_alive(self) -> bool:
+        return self._dash is not None and self._dash.winfo_exists()
 
-        for col, (label, width) in column_data.items():
-            self.dash_tree.heading(col, text=label) # THIS puts the text in the header
-            self.dash_tree.column(col, width=width, anchor="center" if col != "name" else "w")
-
-        # Use fill="both" and expand=True so it shares space with the match assignments
-        self.dash_tree.pack(fill="both", expand=True, padx=50, pady=10)
-
-        # --- 4. LIVE MATCHES SECTION ---
-        tk.Label(self.dash, text="CURRENT LANE ASSIGNMENTS", font=(main_font, 26, "bold"), 
-                 bg="#000000", fg="#00FF7F").pack(pady=20)
-
-        # Announcement bar packed at the bottom
-        self.dash_msg = tk.Label(self.dash, text="WELCOME!", font=(main_font, 36, "bold"), 
-                                 bg="#c0392b", fg="white", pady=10)
-        self.dash_msg.pack(side="bottom", fill="x")
-
-        # Match Text fills the middle gap
-        self.dash_match_text = tk.Text(self.dash, font=(main_font, 32, "bold"), 
-                                      bg="#000000", fg="#FFFFFF", 
-                                      relief="flat", cursor="arrow")
-        self.dash_match_text.pack(fill="both", expand=True, padx=50, pady=10)
-        
-        self.update_dashboard()
-        self.dash.after(1000, self.auto_scroll_leaderboard)
-
-    def auto_scroll_leaderboard(self):
-        if not hasattr(self, 'dash') or not self.dash.winfo_exists(): return
-        
-        all_items = self.dash_tree.get_children()
-        if not all_items: return
-
-        if not hasattr(self, 'scroll_idx'): self.scroll_idx = 0
-        
-        # Adjust this to the number of rows visible when the app starts
-        visible_rows = 11 
-
-        if self.scroll_idx < len(all_items):
-            if self.scroll_idx < visible_rows:
-                # 1. FAST-FORWARD through initially visible rows
-                self.scroll_idx += 1
-                self.dash.after(10, self.auto_scroll_leaderboard)
-            else:
-                # 2. THE CRAWL: Move row-by-row
-                self.dash_tree.see(all_items[self.scroll_idx])
-                self.scroll_idx += 1
-                
-                # Check if we JUST hit the very last row
-                if self.scroll_idx == len(all_items):
-                    # --- PAUSE AT THE BOTTOM ---
-                    # We reached the end. Wait 6 seconds so people can see the last names.
-                    self.dash.after(6000, self.auto_scroll_leaderboard)
-                else:
-                    # Regular scrolling speed
-                    self.dash.after(2000, self.auto_scroll_leaderboard)
-        else:
-            # 3. THE RESET: Snap back to the top after the pause is over
-            self.scroll_idx = 0
-            self.dash_tree.yview_moveto(0) 
-            
-            # Wait 5 seconds at the top before starting the next crawl
-            self.dash.after(5000, self.auto_scroll_leaderboard)
-
-    def reset_leaderboard(self):
-        """Jumps back to the top and restarts the scroll loop after a pause."""
-        if hasattr(self, 'dash') and self.dash.winfo_exists():
-            self.dash_tree.yview_moveto(0)
-            # Wait X milliseconds at the top so the leaders are visible
-            self.dash.after(3000, self.auto_scroll_leaderboard)
-
-    def update_dashboard(self):
-        if not hasattr(self, 'dash') or not self.dash.winfo_exists():
+    def _open_dashboard(self):
+        # If already open, just bring it to front
+        if self._dash_is_alive():
+            self._dash.lift()
             return
 
-        # 1. Update Clock (Always do this)
-        now = datetime.datetime.now().strftime("%H:%M:%S")
-        if hasattr(self, 'dash_clock'):
-            self.dash_clock.config(text=now)
+        self._dash = tk.Toplevel(self.root)
+        self._dash.title("OFFICIAL TOURNAMENT SCOREBOARD")
+        self._dash.state("zoomed")
+        self._dash.configure(bg="#000000")
+        self._dash.protocol("WM_DELETE_WINDOW", self._close_dashboard)
 
-        # 2. ONLY Update Standings Table if we are at the top (pos 0.0)
-        # This prevents the "snapping" effect during auto-scroll
-        view = self.dash_tree.yview()
-        if view[0] == 0.0:
-            for i in self.dash_tree.get_children(): 
-                self.dash_tree.delete(i)
-                
-            conn = sqlite3.connect(self.db_path)
-            standings = conn.execute("SELECT name, wins, diff FROM players ORDER BY wins DESC, diff DESC").fetchall()
-            for i, row in enumerate(standings, 1):
-                self.dash_tree.insert("", "end", values=(i, f" {row[0]}", row[1], row[2]))
-            conn.close()
+        os_name   = platform.system()
+        style     = ttk.Style()
+        main_font = "Helvetica Neue" if os_name == "Darwin" else "Segoe UI"
 
-        # 3. Update Match Assignments (Massive Text)
-        # We can update this every time because it's a separate box
-        conn = sqlite3.connect(self.db_path)
-        self.dash_match_text.config(state="normal")
-        self.dash_match_text.delete("1.0", "end")
-        matches = conn.execute("SELECT terrain, t1, t2 FROM matches WHERE status='Playing' ORDER BY terrain ASC").fetchall()
-        
-        if not matches:
-            self.dash_match_text.insert("end", "\n\n--- ROUND FINISHED / WAITING ---")
+        style.theme_use("aqua" if os_name == "Darwin" else "clam")
+        style.configure("Dash.Treeview",
+                        background="#1a1a1a", foreground="white",
+                        fieldbackground="#1a1a1a",
+                        font=(main_font, 32), rowheight=55)
+        style.configure("Dash.Treeview.Heading",
+                        background="#003366", foreground="#FFFFFF",
+                        font=(main_font, 22, "bold"))
+        style.map("Dash.Treeview.Heading",
+                  background=[("active", "#003366"), ("!disabled", "#003366")],
+                  foreground=[("active", "#003366"), ("!disabled", "#003366")])
+        style.map("Dash.Treeview",
+                  foreground=[("selected", "white"),  ("!disabled", "white")],
+                  background=[("selected", "#34495e"), ("!disabled", "#1a1a1a")])
+
+        # Header
+        header = tk.Frame(self._dash, bg="#000000")
+        header.pack(fill="x", pady=20)
+
+        tk.Label(header, text="🏆 LEADERBOARD",
+                 font=(main_font, 28, "bold"),
+                 bg="#000000", fg="#FFD700").pack(side="left", padx=50)
+
+        right = tk.Frame(header, bg="#000000")
+        right.pack(side="right", padx=50)
+
+        try:
+            img = Image.open(resource_path("boule icon.png"))
+            img = img.resize((80, 80), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            icon_lbl = tk.Label(right, image=photo, bg="#000000")
+            icon_lbl.image = photo  # prevent GC
+            icon_lbl.pack(side="right", padx=10)
+        except Exception as exc:
+            print(f"Icon not loaded: {exc}")
+
+        self._dash_clock = tk.Label(right, text="", font=("Consolas", 24),
+                                    bg="#000000", fg="#00FF00")
+        self._dash_clock.pack(side="right", padx=20)
+
+        # Standings tree
+        self._dash_tree = ttk.Treeview(
+            self._dash,
+            columns=("rank", "name", "wins", "diff"),
+            show="headings", height=11, style="Dash.Treeview"
+        )
+        for col, label, width, anchor in [
+            ("rank", "Rank",         80,  "center"),
+            ("name", "Player / Team",500, "w"),
+            ("wins", "Wins",         80,  "center"),
+            ("diff", "+/-",          80,  "center"),
+        ]:
+            self._dash_tree.heading(col, text=label)
+            self._dash_tree.column(col, width=width, anchor=anchor)
+        self._dash_tree.pack(fill="both", expand=True, padx=50, pady=10)
+
+        # Lane assignments label
+        tk.Label(self._dash, text="CURRENT LANE ASSIGNMENTS",
+                 font=(main_font, 26, "bold"),
+                 bg="#000000", fg="#00FF7F").pack(pady=20)
+
+        # Announcement bar (bottom)
+        self._dash_msg = tk.Label(self._dash, text="WELCOME!",
+                                  font=(main_font, 36, "bold"),
+                                  bg="#c0392b", fg="white", pady=10)
+        self._dash_msg.pack(side="bottom", fill="x")
+
+        # Match text
+        self._dash_match_text = tk.Text(
+            self._dash, font=(main_font, 32, "bold"),
+            bg="#000000", fg="#FFFFFF", relief="flat", cursor="arrow"
+        )
+        self._dash_match_text.pack(fill="both", expand=True, padx=50, pady=10)
+
+        self._scroll_idx = 0
+        self._standings_dirty = False     # standings just about to be populated
+
+        # Populate standings once immediately, then start the independent loops
+        self._repopulate_dash_standings()
+        self._update_dashboard_live()          # clock / lanes / ticker — every second
+        self._dash.after(1500, self._auto_scroll_leaderboard)  # scroll starts after a short pause
+
+    def _close_dashboard(self):
+        """Clean shutdown — cancel pending after() calls before destroying."""
+        if self._dash_after_id:
+            try:
+                self._dash.after_cancel(self._dash_after_id)
+            except Exception:
+                pass
+            self._dash_after_id = None
+        if self._dash_is_alive():
+            self._dash.destroy()
+
+    def _update_dashboard(self):
+        """Called from _refresh_all whenever data changes. Marks standings dirty
+        so the scroll loop will repopulate them at the next top-of-list opportunity."""
+        if not self._dash_is_alive():
+            return
+        self._standings_dirty = True
+
+    def _repopulate_dash_standings(self):
+        """Wipe and refill the leaderboard tree. Only called when scroll is at position 0."""
+        for row in self._dash_tree.get_children():
+            self._dash_tree.delete(row)
+        for i, p in enumerate(self.db.get_standings(), 1):
+            self._dash_tree.insert("", "end",
+                values=(i, f"  {p['name']}", p["wins"], p["diff"]))
+        self._standings_dirty = False
+
+    def _update_dashboard_live(self):
+        """Runs every second. Updates clock, lane assignments, and ticker only.
+        Never touches the standings tree — that is owned by the scroll loop."""
+        if not self._dash_is_alive():
+            return
+
+        # Clock
+        self._dash_clock.config(text=datetime.datetime.now().strftime("%H:%M:%S"))
+
+        # Lane assignments
+        self._dash_match_text.config(state="normal")
+        self._dash_match_text.delete("1.0", "end")
+        matches = self.db.get_playing_matches()
+        if matches:
+            for m in matches:
+                self._dash_match_text.insert(
+                    "end", f"LANE {m['terrain']}:   {m['t1']}   vs   {m['t2']}\n"
+                )
         else:
-            for row in matches:
-                line = f"LANE {row[0]}:   {row[1]}   vs   {row[2]}\n"
-                self.dash_match_text.insert("end", line)
+            self._dash_match_text.insert("end", "\n\n— ROUND FINISHED / WAITING —")
 
-        self.dash_match_text.tag_add("center", "1.0", "end")
-        self.dash_match_text.tag_configure("center", justify='center', spacing1=15)
-        self.dash_match_text.config(state="disabled")
-        conn.close()
+        self._dash_match_text.tag_add("center", "1.0", "end")
+        self._dash_match_text.tag_configure("center", justify="center", spacing1=15)
+        self._dash_match_text.config(state="disabled")
 
-        # 4. Update Announcement Bar
-        if hasattr(self, 'announce_entry') and hasattr(self, 'dash_msg'):
-            msg = self.announce_entry.get().strip()
-            self.dash_msg.config(text=msg if msg else "WELCOME TO THE TOURNAMENT!")
+        # Announcement ticker
+        msg = self.announce_entry.get().strip()
+        self._dash_msg.config(text=msg or "WELCOME TO THE TOURNAMENT!")
 
-        self.dash.after(1000, self.update_dashboard)
+        # Schedule exactly ONE next call (stored so we can cancel it)
+        self._dash_after_id = self._dash.after(1000, self._update_dashboard_live)
+
+    def _auto_scroll_leaderboard(self):
+        if not self._dash_is_alive():
+            return
+
+        visible = 11  # rows shown without scrolling
+
+        # --- At the top: apply any pending standings update then start the crawl ---
+        if self._scroll_idx == 0:
+            if self._standings_dirty:
+                self._repopulate_dash_standings()
+            items = self._dash_tree.get_children()
+            if not items:
+                self._dash.after(2000, self._auto_scroll_leaderboard)
+                return
+            # If everything fits on screen there is nothing to scroll — just wait
+            if len(items) <= visible:
+                self._dash.after(5000, self._auto_scroll_leaderboard)
+                return
+            # Fast-forward the index past the initially visible rows
+            self._scroll_idx = visible
+
+        items = self._dash_tree.get_children()
+
+        if self._scroll_idx < len(items):
+            # Crawl one row at a time
+            self._dash_tree.see(items[self._scroll_idx])
+            self._scroll_idx += 1
+            # Longer pause on the very last row so the bottom names are readable
+            delay = 6000 if self._scroll_idx >= len(items) else 2000
+            self._dash.after(delay, self._auto_scroll_leaderboard)
+        else:
+            # Bottom reached — snap back to top and pause before next cycle
+            self._scroll_idx = 0
+            self._dash_tree.yview_moveto(0)
+            self._dash.after(5000, self._auto_scroll_leaderboard)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     root = tk.Tk()
-    # Lift window to front for Mac users
     root.lift()
-    root.attributes('-topmost', True)
-    root.after_idle(root.attributes, '-topmost', False)
-    app = PetanqueProMaster(root)
+    root.attributes("-topmost", True)
+    root.after_idle(root.attributes, "-topmost", False)
+    PetanqueProMaster(root)
     root.mainloop()
