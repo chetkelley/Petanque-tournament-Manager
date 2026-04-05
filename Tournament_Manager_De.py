@@ -8,7 +8,6 @@ from tkinter import ttk, messagebox
 import sqlite3
 import pandas as pd
 import datetime
-import platform
 import random
 import os
 import sys
@@ -148,6 +147,13 @@ class Datenbank:
             return conn.execute(
                 "SELECT terrain, t1, t2 FROM matches WHERE status=? ORDER BY terrain ASC",
                 (SpielStatus.SPIELT,)
+            ).fetchall()
+
+    def wartende_spiele_holen(self, limit: int = 2) -> list:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT t1, t2 FROM matches WHERE status=? ORDER BY id ASC LIMIT ?",
+                (SpielStatus.WARTEND, limit)
             ).fetchall()
 
     def spiel_beenden(self, conn, match_id: int):
@@ -338,6 +344,10 @@ class PetanqueProMaster:
             bahn = m["terrain"] if m["terrain"] and m["terrain"] > 0 else "-"
             self.m_tree.insert("", "end", values=(m["id"], bahn, m["t1"], "vs", m["t2"], m["status"]))
 
+        # Signalisiert der Scroll-Schleife, dass die Rangliste neu geladen werden muss
+        if self._dash_ist_aktiv():
+            self._rangliste_dirty = True
+
     # -----------------------------------------------------------------------
     # Spielerverwaltung
     # -----------------------------------------------------------------------
@@ -518,11 +528,7 @@ class PetanqueProMaster:
         self._dash.configure(bg="black")
         self._dash.protocol("WM_DELETE_WINDOW", self._dashboard_schliessen)
 
-        os_name = platform.system()
-        if os_name == "Windows":
-            self._dash.state("zoomed")
-        else:
-            self._dash.geometry("1200x800")
+        self._dash.state("zoomed")
 
         # Stile
         style = ttk.Style()
@@ -561,7 +567,16 @@ class PetanqueProMaster:
                                  bg="black", fg="#00ff00")
         self._lbl_uhr.pack(side="right", padx=20)
 
-        # Ranglisten-Treeview
+        # Durchsage-Banner (zuerst packen damit er immer unten bleibt)
+        self.d_msg = tk.Label(self._dash, text="",
+                              font=("Arial", 30, "bold"),
+                              bg="#c0392b", fg="white", pady=10)
+        self.d_msg.pack(side="bottom", fill="x")
+
+        # Rangliste expandiert — Bahntext hat feste Höhe (Bahnen + 2 Wartende)
+        txt_hoehe = self._max_bahnen() + 2
+
+        # Ranglisten-Treeview — nimmt den gesamten verbleibenden Platz
         cols = ("rang", "name", "siege", "diff")
         self.d_tree = ttk.Treeview(self._dash, columns=cols, show="headings",
                                    style="D.Treeview")
@@ -573,28 +588,26 @@ class PetanqueProMaster:
         ]:
             self.d_tree.heading(col, text=label)
             self.d_tree.column(col, anchor="center", width=width)
-        self.d_tree.pack(fill="both", expand=True, padx=40)
+        self.d_tree.pack(fill="both", expand=True, padx=40, pady=(0, 5))
 
-        # Bahnbelegung
+        # Bahnbelegung — feste Höhe, wächst nicht mit dem Fenster
         tk.Label(self._dash, text="AKTUELL AUF DEN BAHNEN",
-                 font=("Arial", 22, "bold"), bg="black", fg="#00FF7F").pack(pady=10)
+                 font=("Arial", 22, "bold"), bg="black", fg="#00FF7F").pack(pady=5)
 
         self.d_txt = tk.Text(self._dash, font=("Arial", 28, "bold"),
-                             bg="black", fg="white", height=4, relief="flat", cursor="arrow")
-        self.d_txt.pack(fill="x", padx=40)
-
-        # Durchsage-Banner
-        self.d_msg = tk.Label(self._dash, text="",
-                              font=("Arial", 30, "bold"),
-                              bg="#c0392b", fg="white", pady=10)
-        self.d_msg.pack(side="bottom", fill="x")
+                             bg="black", fg="white", height=txt_hoehe,
+                             relief="flat", cursor="arrow",
+                             padx=10, pady=12)
+        self.d_txt.pack(fill="x", padx=40, pady=(5, 15))
 
         self._scroll_idx = 0
+        self._rangliste_dirty = False  # Rangliste wird sofort befüllt — kein Update nötig
 
-        # Drei unabhängige Schleifen starten
+        # Rangliste einmalig sofort befüllen, dann unabhängige Schleifen starten
+        self._rangliste_neu_befuellen()
         self._dash_uhr_update()
-        self._dash_daten_update()          # Füllt den Baum sofort beim Öffnen
-        self._dash.after(2000, self._dash_scroll_update)   # Kurz warten bis Daten geladen
+        self._dash_daten_update()          # Bahnen & Durchsage — jede Sekunde
+        self._dash.after(1500, self._dash_scroll_update)   # Scroll startet nach kurzem Pause
 
     def _dashboard_schliessen(self):
         """Sauberes Beenden — alle laufenden after()-Aufrufe abbrechen."""
@@ -617,24 +630,21 @@ class PetanqueProMaster:
         self._after_uhr = self.root.after(1000, self._dash_uhr_update)
 
     def _dash_daten_update(self):
-        """Schleife 2: Daten — aktualisiert alle 5 Sekunden."""
+        """Schleife 2: Bahnen & Durchsage — aktualisiert jede Sekunde.
+        Berührt die Rangliste nie — die gehört ausschliesslich der Scroll-Schleife."""
         if not self._dash_ist_aktiv():
             return
 
-        # Rangliste — nur neu befüllen wenn Ansicht oben ist, sonst wird Scroll-Position zurückgesetzt
-        if self.d_tree.yview()[0] == 0.0:
-            for r in self.d_tree.get_children():
-                self.d_tree.delete(r)
-            for i, p in enumerate(self.db.alle_spieler_holen(), 1):
-                self.d_tree.insert("", "end", values=(i, p["name"], p["wins"], p["diff"]))
-
-        # Bahnbelegung
+        # Bahnbelegung — laufende Spiele + bis zu 2 wartende
         self.d_txt.config(state="normal")
         self.d_txt.delete("1.0", "end")
         spiele = self.db.laufende_spiele_holen()
+        wartend = self.db.wartende_spiele_holen(limit=2)
         if spiele:
             for m in spiele:
                 self.d_txt.insert("end", f"BAHN {m['terrain']}:  {m['t1']}  vs  {m['t2']}\n")
+            for w in wartend:
+                self.d_txt.insert("end", f"  ⏳  {w['t1']}  vs  {w['t2']}\n")
         else:
             self.d_txt.insert("end", "\n— RUNDE BEENDET —")
         self.d_txt.tag_add("center", "1.0", "end")
@@ -644,29 +654,48 @@ class PetanqueProMaster:
         # Durchsage
         self.d_msg.config(text=self.announce_entry.get().upper())
 
-        self._after_daten = self.root.after(5000, self._dash_daten_update)
+        self._after_daten = self.root.after(1000, self._dash_daten_update)
+
+    def _rangliste_neu_befuellen(self):
+        """Löscht die Rangliste und füllt sie neu. Wird nur aufgerufen wenn Scroll-Index = 0."""
+        for r in self.d_tree.get_children():
+            self.d_tree.delete(r)
+        for i, p in enumerate(self.db.alle_spieler_holen(), 1):
+            self.d_tree.insert("", "end", values=(i, p["name"], p["wins"], p["diff"]))
+        self._rangliste_dirty = False
 
     def _dash_scroll_update(self):
         """Schleife 3: Auto-Scroll — bewegt sich zeilenweise durch die Rangliste."""
         if not self._dash_ist_aktiv():
             return
 
-        eintraege = self.d_tree.get_children()
-        if not eintraege:
-            self._after_scroll = self.root.after(2000, self._dash_scroll_update)
-            return
-
         sichtbar = 8  # Anzahl der ohne Scrollen sichtbaren Zeilen
+
+        # Am Anfang: ausstehende Datenaktualisierung anwenden, dann Crawl starten
+        if self._scroll_idx == 0:
+            if self._rangliste_dirty:
+                self._rangliste_neu_befuellen()
+            eintraege = self.d_tree.get_children()
+            if not eintraege:
+                self._after_scroll = self.root.after(2000, self._dash_scroll_update)
+                return
+            # Wenn alles auf den Bildschirm passt, gibt es nichts zu scrollen
+            if len(eintraege) <= sichtbar:
+                self._after_scroll = self.root.after(5000, self._dash_scroll_update)
+                return
+            # Index hinter die bereits sichtbaren Zeilen springen
+            self._scroll_idx = sichtbar
+
+        eintraege = self.d_tree.get_children()
 
         if self._scroll_idx < len(eintraege):
             self.d_tree.see(eintraege[self._scroll_idx])
-            ist_sichtbar = self._scroll_idx < sichtbar
             self._scroll_idx += 1
-            # Kurze Verzögerung für bereits sichtbare Zeilen, lange nur beim echten Scrollen
-            verzoegerung = 200 if ist_sichtbar else (6000 if self._scroll_idx == len(eintraege) else 3000)
+            # Längere Pause bei der letzten Zeile
+            verzoegerung = 6000 if self._scroll_idx >= len(eintraege) else 3000
             self._after_scroll = self.root.after(verzoegerung, self._dash_scroll_update)
         else:
-            # Zurück nach oben und pausieren
+            # Unten angekommen — zurück nach oben und pausieren
             self._scroll_idx = 0
             self.d_tree.yview_moveto(0)
             self._after_scroll = self.root.after(5000, self._dash_scroll_update)

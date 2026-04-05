@@ -8,7 +8,6 @@ from tkinter import ttk, messagebox
 import sqlite3
 import pandas as pd
 import datetime
-import platform
 import random
 import os
 import sys
@@ -178,6 +177,13 @@ class Database:
             return conn.execute(
                 "SELECT terrain, t1, t2 FROM matches WHERE status=? ORDER BY terrain ASC",
                 (MatchStatus.PLAYING,)
+            ).fetchall()
+
+    def get_waiting_matches(self, limit: int = 2) -> list:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT t1, t2 FROM matches WHERE status=? ORDER BY id ASC LIMIT ?",
+                (MatchStatus.WAITING, limit)
             ).fetchall()
 
     def finish_match(self, conn, match_id: int):
@@ -689,75 +695,45 @@ class PetanqueProMaster:
     # -----------------------------------------------------------------------
 
     def _undo_last_score(self):
-        """Reverses the last result and restores the match to its original terrain."""
-        # Connect using the correct path from your Database class
-        conn = sqlite3.connect(self.db.path) 
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-    
-        # 1. Pull the last entry from history (including the terrain it was played on)
-        last_match = cursor.execute(
-            "SELECT id, match_id, terrain, team_a, team_b, score_a, score_b FROM history ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-    
-        if not last_match:
+        """Reverses the last result and restores the match to its original lane."""
+        last = self.db.get_last_history()
+        if not last:
             messagebox.showinfo("Undo", "No match history found to undo.")
-            conn.close()
             return
 
-        h_id = last_match['id']
-        orig_terrain = last_match['terrain']
-        t1_str = last_match['team_a']
-        t2_str = last_match['team_b']
-        s1 = last_match['score_a']
-        s2 = last_match['score_b']
+        h_id     = last["id"]
+        match_id = last["match_id"]
+        terrain  = last["terrain"]
+        t1, t2   = last["team_a"], last["team_b"]
+        s1, s2   = last["score_a"], last["score_b"]
 
-        if not messagebox.askyesno("Confirm Undo", f"Undo result: {t1_str} ({s1}) vs {t2_str} ({s2})?"):
-           conn.close()
-           return
+        if not messagebox.askyesno("Confirm Undo", f"Undo result: {t1} ({s1}) vs {t2} ({s2})?"):
+            return
 
-        # 2. Reverse the Stats for individuals
-        def get_individuals(name_str):
-           return [n.strip() for n in name_str.replace(' & ', ',').split(',')]
+        with self.db.connect() as conn:
+            # Reverse stats for every individual in both teams
+            for name in split_team(t1):
+                self.db.reverse_player_stats(conn, name, s1, s2, 1 if s1 > s2 else 0)
+            for name in split_team(t2):
+                self.db.reverse_player_stats(conn, name, s2, s1, 1 if s2 > s1 else 0)
 
-        p1, p2 = get_individuals(t1_str), get_individuals(t2_str)
+            # If a match was promoted onto this lane, send it back to Waiting
+            conn.execute(
+                "UPDATE matches SET status=?, terrain=0 WHERE terrain=? AND status=? AND id!=?",
+                (MatchStatus.WAITING, terrain, MatchStatus.PLAYING, match_id)
+            )
 
-        for n in p1:
-           win_val = 1 if s1 > s2 else 0
-           cursor.execute("UPDATE players SET pf=pf-?, pa=pa-?, wins=MAX(0, wins-?), diff=diff-? WHERE name=?", 
-                         (s1, s2, win_val, (s1 - s2), n))
-        for n in p2:
-           win_val = 1 if s2 > s1 else 0
-           cursor.execute("UPDATE players SET pf=pf-?, pa=pa-?, wins=MAX(0, wins-?), diff=diff-? WHERE name=?", 
-                         (s2, s1, win_val, (s2 - s1), n))
+            # Restore the original match to Playing on its original lane by ID
+            conn.execute(
+                "UPDATE matches SET terrain=?, status=? WHERE id=?",
+                (terrain, MatchStatus.PLAYING, match_id)
+            )
 
-        # 3. Handle Lane Displacement
-        # Check if another match has already moved onto the original terrain
-        occupant = cursor.execute("SELECT id, t1, t2 FROM matches WHERE terrain=? AND status=?", 
-                                (orig_terrain, MatchStatus.PLAYING)).fetchone()
-        
-        if occupant:
-            # If the lane is now taken, move the current occupant back to Waiting
-            cursor.execute("UPDATE matches SET terrain=0, status=? WHERE id=?", 
-                          (MatchStatus.WAITING, occupant['id']))
+            # Remove the history entry
+            self.db.delete_history(conn, h_id)
 
-        # 4. Restore the original match to the original terrain
-        cursor.execute("""
-            UPDATE matches 
-            SET terrain = ?, status = ? 
-            WHERE ((t1 = ? AND t2 = ?) OR (t1 = ? AND t2 = ?)) 
-            AND status = ?
-        """, (orig_terrain, MatchStatus.PLAYING, t1_str, t2_str, t2_str, t1_str, MatchStatus.FINISHED))
-
-        # 5. Clean up history
-        cursor.execute("DELETE FROM history WHERE id=?", (h_id,))
-
-        conn.commit()
-        conn.close()
-
-        # Refresh the UI
         self._refresh_all()
-        messagebox.showinfo("Success", f"Restored {t1_str} vs {t2_str} to Lane {orig_terrain}.")
+        messagebox.showinfo("Undo", f"Restored {t1} vs {t2} to Lane {terrain}. Enter the correct score.")
 
     # -----------------------------------------------------------------------
     # Export
@@ -799,15 +775,16 @@ class PetanqueProMaster:
 
         self._dash = tk.Toplevel(self.root)
         self._dash.title("OFFICIAL TOURNAMENT SCOREBOARD")
-        self._dash.state("zoomed")
         self._dash.configure(bg="#000000")
         self._dash.protocol("WM_DELETE_WINDOW", self._close_dashboard)
+        # Set a large default geometry so exiting fullscreen restores to a usable size
+        self._dash.geometry("1400x900")
+        self._dash.minsize(900, 600)
+        self._dash.attributes("-fullscreen", True)
 
-        os_name   = platform.system()
+        main_font = "Helvetica Neue"
         style     = ttk.Style()
-        main_font = "Helvetica Neue" if os_name == "Darwin" else "Segoe UI"
-
-        style.theme_use("aqua" if os_name == "Darwin" else "clam")
+        style.theme_use("aqua")
         style.configure("Dash.Treeview",
                         background="#1a1a1a", foreground="white",
                         fieldbackground="#1a1a1a",
@@ -847,11 +824,39 @@ class PetanqueProMaster:
                                     bg="#000000", fg="#00FF00")
         self._dash_clock.pack(side="right", padx=20)
 
-        # Standings tree
+        # Announcement bar (bottom — packed first so it always stays pinned)
+        self._dash_msg = tk.Label(self._dash, text="WELCOME!",
+                                  font=(main_font, 36, "bold"),
+                                  bg="#c0392b", fg="white", pady=10)
+        self._dash_msg.pack(side="bottom", fill="x")
+
+        # Bottom section — fixed pixel height so font size doesn't affect sizing
+        # Mac renders Helvetica Neue 32 bold at ~62px per line; label + padding ~80px extra
+        line_px   = 62
+        pad_px    = 80
+        n_lines   = self._max_terrains() + 2
+        txt_px    = n_lines * line_px + pad_px
+
+        bottom = tk.Frame(self._dash, bg="#000000", height=txt_px)
+        bottom.pack(side="bottom", fill="x")
+        bottom.pack_propagate(False)  # hold the fixed height
+
+        tk.Label(bottom, text="CURRENT LANE ASSIGNMENTS",
+                 font=(main_font, 26, "bold"),
+                 bg="#000000", fg="#00FF7F").pack(pady=5)
+
+        self._dash_match_text = tk.Text(
+            bottom, font=(main_font, 32, "bold"),
+            bg="#000000", fg="#FFFFFF", relief="flat", cursor="arrow",
+            padx=10, pady=12
+        )
+        self._dash_match_text.pack(fill="both", expand=True, padx=50, pady=(0, 10))
+
+        # Standings tree — takes all remaining space between header and bottom section
         self._dash_tree = ttk.Treeview(
             self._dash,
             columns=("rank", "name", "wins", "diff"),
-            show="headings", height=11, style="Dash.Treeview"
+            show="headings", style="Dash.Treeview"
         )
         for col, label, width, anchor in [
             ("rank", "Rank",         80,  "center"),
@@ -862,24 +867,6 @@ class PetanqueProMaster:
             self._dash_tree.heading(col, text=label)
             self._dash_tree.column(col, width=width, anchor=anchor)
         self._dash_tree.pack(fill="both", expand=True, padx=50, pady=10)
-
-        # Lane assignments label
-        tk.Label(self._dash, text="CURRENT LANE ASSIGNMENTS",
-                 font=(main_font, 26, "bold"),
-                 bg="#000000", fg="#00FF7F").pack(pady=20)
-
-        # Announcement bar (bottom)
-        self._dash_msg = tk.Label(self._dash, text="WELCOME!",
-                                  font=(main_font, 36, "bold"),
-                                  bg="#c0392b", fg="white", pady=10)
-        self._dash_msg.pack(side="bottom", fill="x")
-
-        # Match text
-        self._dash_match_text = tk.Text(
-            self._dash, font=(main_font, 32, "bold"),
-            bg="#000000", fg="#FFFFFF", relief="flat", cursor="arrow"
-        )
-        self._dash_match_text.pack(fill="both", expand=True, padx=50, pady=10)
 
         self._scroll_idx = 0
         self._standings_dirty = False     # standings just about to be populated
@@ -925,14 +912,19 @@ class PetanqueProMaster:
         # Clock
         self._dash_clock.config(text=datetime.datetime.now().strftime("%H:%M:%S"))
 
-        # Lane assignments
+        # Lane assignments — playing games + up to 2 waiting
         self._dash_match_text.config(state="normal")
         self._dash_match_text.delete("1.0", "end")
         matches = self.db.get_playing_matches()
+        waiting = self.db.get_waiting_matches(limit=2)
         if matches:
             for m in matches:
                 self._dash_match_text.insert(
                     "end", f"LANE {m['terrain']}:   {m['t1']}   vs   {m['t2']}\n"
+                )
+            for w in waiting:
+                self._dash_match_text.insert(
+                    "end", f"  ⏳   {w['t1']}   vs   {w['t2']}\n"
                 )
         else:
             self._dash_match_text.insert("end", "\n\n— ROUND FINISHED / WAITING —")
