@@ -287,6 +287,12 @@ class TournamentEngine:
         """
         Return (pairs, bye_player_or_None).
         pairs = [(t1, t2), ...]
+
+        Pairing strategy: players arrive pre-sorted by rank (wins DESC, diff DESC).
+        For each unpaired player, find the closest-ranked opponent they haven't
+        already faced. Only fall back to a rematch if no fresh opponent exists.
+        This keeps winners playing winners and losers playing losers as fairly
+        as possible while still avoiding rematches.
         """
         players = list(player_names)
         bye = None
@@ -294,18 +300,25 @@ class TournamentEngine:
         if len(players) % 2 != 0:
             bye = players.pop()
 
-        paired = []
+        paired   = []
         unpaired = list(players)
 
         while len(unpaired) >= 2:
             t1 = unpaired.pop(0)
-            matched = False
+
+            # Search the remaining list in order (closest rank first).
+            # Accept the first opponent t1 hasn't played before.
+            best_idx = None
             for i, candidate in enumerate(unpaired):
                 if not already_played_fn(t1, candidate):
-                    paired.append((t1, unpaired.pop(i)))
-                    matched = True
-                    break
-            if not matched:
+                    best_idx = i
+                    break  # first = closest rank — stop immediately
+
+            if best_idx is not None:
+                paired.append((t1, unpaired.pop(best_idx)))
+            else:
+                # Every remaining opponent is a rematch — accept the closest
+                # ranked one (index 0) rather than a random pick
                 paired.append((t1, unpaired.pop(0)))
 
         return paired, bye
@@ -793,7 +806,7 @@ class PetanqueProMaster:
                         background="#003366", foreground="#FFFFFF",
                         font=(main_font, 22, "bold"))
         style.map("Dash.Treeview.Heading",
-                  background=[("active", "#003366"), ("!disabled", "#003366")],
+                  background=[("active", "#FFFFFF"), ("!disabled", "#FFFFFF")],
                   foreground=[("active", "#003366"), ("!disabled", "#003366")])
         style.map("Dash.Treeview",
                   foreground=[("selected", "white"),  ("!disabled", "white")],
