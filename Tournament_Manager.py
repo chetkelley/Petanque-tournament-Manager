@@ -100,7 +100,15 @@ class Database:
                     score_b   INTEGER,
                     round_num INTEGER
                 );
-
+                CREATE TABLE IF NOT EXISTS payments (
+                    id     INTEGER PRIMARY KEY,
+                    name   TEXT,
+                    amount REAL
+                );
+                CREATE TABLE IF NOT EXISTS settings (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
+                );
             """)
 
     # -- Players --
@@ -246,11 +254,69 @@ class Database:
             row = conn.execute("SELECT MAX(round_num) as r FROM history").fetchone()
             return (row["r"] or 0) + 1
 
+    # -- Payments --
+
+    def get_fee(self) -> float:
+        with self.connect() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key='fee'").fetchone()
+            return float(row["value"]) if row else 0.0
+
+    def set_fee(self, amount: float):
+        with self.connect() as conn:
+            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('fee', ?)",
+                         (str(amount),))
+
+    def add_payment(self, name: str, amount: float):
+        with self.connect() as conn:
+            conn.execute("INSERT INTO payments (name, amount) VALUES (?,?)", (name, amount))
+
+    def get_payments(self) -> list:
+        """Return each registered player/team with total paid and balance owed."""
+        with self.connect() as conn:
+            fee     = self.get_fee()
+            players = conn.execute("SELECT name FROM players ORDER BY name ASC").fetchall()
+            result  = []
+            for p in players:
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(amount), 0) AS paid FROM payments WHERE name=?",
+                    (p["name"],)
+                ).fetchone()
+                paid = round(row["paid"], 2)
+                owed = round(max(0.0, fee - paid), 2)
+                result.append({"name": p["name"], "paid": paid, "owed": owed})
+            return result
+
+    def get_payment_summary(self) -> dict:
+        with self.connect() as conn:
+            fee        = self.get_fee()
+            n          = conn.execute("SELECT COUNT(*) AS c FROM players").fetchone()["c"]
+            total_due  = round(fee * n, 2)
+            collected  = conn.execute(
+                "SELECT COALESCE(SUM(amount), 0) AS s FROM payments"
+            ).fetchone()["s"]
+            collected  = round(collected, 2)
+            fully_paid = conn.execute(
+                """SELECT COUNT(*) AS c FROM (
+                       SELECT name, SUM(amount) AS paid FROM payments GROUP BY name
+                       HAVING paid >= ?
+                   )""", (fee,)
+            ).fetchone()["c"]
+            return {
+                "total_due":   total_due,
+                "collected":   collected,
+                "outstanding": round(total_due - collected, 2),
+                "fully_paid":  fully_paid,
+                "n":           n,
+            }
+
     # -- Bulk --
 
     def reset_all(self):
         with self.connect() as conn:
-            conn.executescript("DELETE FROM players; DELETE FROM matches; DELETE FROM history;")
+            conn.executescript(
+                "DELETE FROM players; DELETE FROM matches; "
+                "DELETE FROM history; DELETE FROM payments;"
+            )
 
     def get_standings_df(self):
         with self.connect() as conn:
@@ -404,12 +470,15 @@ class PetanqueProMaster:
         self.tabs = ttk.Notebook(self.root)
         self.tab_standings = tk.Frame(self.tabs, padx=20, pady=20)
         self.tab_matches   = tk.Frame(self.tabs, padx=20, pady=20)
+        self.tab_payments  = tk.Frame(self.tabs, padx=20, pady=20)
         self.tabs.add(self.tab_standings, text=" 1. Leaderboard ")
         self.tabs.add(self.tab_matches,   text=" 2. Live Matches & Draw ")
+        self.tabs.add(self.tab_payments,  text=" 3. Entry Fees ")
         self.tabs.pack(expand=True, fill="both")
 
         self._build_standings_tab()
         self._build_matches_tab()
+        self._build_payments_tab()
 
     def _build_standings_tab(self):
         mgmt = tk.LabelFrame(self.tab_standings, text="Tournament Management", padx=10, pady=10)
@@ -489,6 +558,54 @@ class PetanqueProMaster:
         self.match_list.pack(fill="both", expand=True, pady=10)
         self.match_list.bind("<Double-1>", self._on_match_double_click)
 
+    def _build_payments_tab(self):
+        # Fee configuration row
+        fee_frame = tk.LabelFrame(self.tab_payments, text="Fee Configuration", padx=10, pady=10)
+        fee_frame.pack(fill="x", pady=5)
+
+        tk.Label(fee_frame, text="Entry fee per team/player ($):",
+                 font=("Arial", 11)).pack(side="left", padx=5)
+        self.entry_fee = tk.Entry(fee_frame, width=8, font=("Arial", 12), justify="center")
+        self.entry_fee.pack(side="left", padx=5)
+        self.entry_fee.insert(0, f"{self.db.get_fee():.2f}")
+        tk.Button(fee_frame, text="Save Fee", command=self._save_fee,
+                  bg="#27ae60").pack(side="left", padx=10)
+
+        # Summary bar
+        self.lbl_summary = tk.Label(self.tab_payments, text="", font=("Arial", 11, "bold"),
+                                    bg="#2c3e50", fg="white", pady=6)
+        self.lbl_summary.pack(fill="x", pady=(5, 0))
+
+        # Payment entry row
+        pay_frame = tk.LabelFrame(self.tab_payments, text="Record Payment", padx=10, pady=10)
+        pay_frame.pack(fill="x", pady=5)
+
+        tk.Label(pay_frame, text="Amount ($):", font=("Arial", 11)).pack(side="left", padx=5)
+        self.entry_payment = tk.Entry(pay_frame, width=8, font=("Arial", 12), justify="center")
+        self.entry_payment.pack(side="left", padx=5)
+        tk.Button(pay_frame, text="Record Payment",
+                  command=self._record_payment, bg="#3498db").pack(side="left", padx=10)
+        tk.Label(pay_frame, text="(Select a team/player in the list below, then record payment)",
+                 fg="gray", font=("Arial", 9)).pack(side="left", padx=5)
+
+        # Payment list
+        cols = ("name", "paid", "owed", "status")
+        self.pay_tree = ttk.Treeview(self.tab_payments, columns=cols, show="headings")
+        for col, head, width in [
+            ("name",   "Team / Player",  250),
+            ("paid",   "Paid ($)",       130),
+            ("owed",   "Outstanding ($)", 130),
+            ("status", "Status",         120),
+        ]:
+            self.pay_tree.heading(col, text=head)
+            self.pay_tree.column(col, width=width, anchor="center")
+
+        self.pay_tree.tag_configure("paid",    background="#d5f5e3")
+        self.pay_tree.tag_configure("partial", background="#fdebd0")
+        self.pay_tree.tag_configure("unpaid",  background="#fadbd8")
+
+        self.pay_tree.pack(fill="both", expand=True, pady=10)
+
     # -----------------------------------------------------------------------
     # Refresh
     # -----------------------------------------------------------------------
@@ -511,6 +628,69 @@ class PetanqueProMaster:
         # Push to dashboard if open
         if self._dash_is_alive():
             self._update_dashboard()
+
+        self._refresh_payments()
+
+    def _refresh_payments(self):
+        """Repopulate the payments tab list and summary bar."""
+        if not hasattr(self, "pay_tree"):
+            return
+        for row in self.pay_tree.get_children():
+            self.pay_tree.delete(row)
+
+        fee = self.db.get_fee()
+        for p in self.db.get_payments():
+            if p["owed"] <= 0:
+                tag, status = "paid",    "✅ Paid"
+            elif p["paid"] > 0:
+                tag, status = "partial", "⚠️ Partial"
+            else:
+                tag, status = "unpaid",  "❌ Outstanding"
+            self.pay_tree.insert("", "end", tags=(tag,),
+                values=(p["name"], f"{p['paid']:.2f}", f"{p['owed']:.2f}", status))
+
+        s = self.db.get_payment_summary()
+        self.lbl_summary.config(
+            text=f"  Due: ${s['total_due']:.2f}   |   "
+                 f"Collected: ${s['collected']:.2f}   |   "
+                 f"Outstanding: ${s['outstanding']:.2f}   |   "
+                 f"Fully paid: {s['fully_paid']} / {s['n']}"
+        )
+
+    def _save_fee(self):
+        try:
+            amount = float(self.entry_fee.get().replace(",", "."))
+            self.db.set_fee(amount)
+            self._refresh_payments()
+        except ValueError:
+            messagebox.showerror("Error", "Please enter a valid amount (e.g. 15.00)")
+
+    def _record_payment(self):
+        sel = self.pay_tree.selection()
+        if not sel:
+            messagebox.showwarning("Selection", "Please select a team/player in the list first.")
+            return
+        name = self.pay_tree.item(sel[0], "values")[0]
+        try:
+            amount = float(self.entry_payment.get().replace(",", "."))
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Error", "Please enter a valid amount (e.g. 5.00)")
+            return
+
+        # Warn if payment would exceed the configured fee
+        fee = self.db.get_fee()
+        payments = self.db.get_payments()
+        already_paid = next((p["paid"] for p in payments if p["name"] == name), 0.0)
+        if fee > 0 and already_paid + amount > fee:
+            if not messagebox.askyesno("Overpayment",
+                    f"{name} would have paid more than the entry fee (${fee:.2f}). Continue?"):
+                return
+
+        self.db.add_payment(name, amount)
+        self.entry_payment.delete(0, tk.END)
+        self._refresh_payments()
 
     # -----------------------------------------------------------------------
     # Player management
