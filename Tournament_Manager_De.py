@@ -362,19 +362,26 @@ class TournamentEngine:
     @staticmethod
     def melee_teams(player_names: list[str]) -> tuple[list, str | None]:
         """
-        Return (pairs, bye_player_or_None).
-        Randomly mixes players into 2v2 teams, using 3v3 to handle
-        counts that don't divide cleanly into groups of four.
+        Return (matches, None) — no bye is ever issued.
+
+        Odd count: one match is upgraded to 3v2 so everyone plays.
+        Even count: standard 2v2 throughout, with 3v3 inserted where
+        needed for counts that don't divide cleanly into groups of four.
+
+        Strategy for odd counts:
+          - Reserve one player as "extra"
+          - Pair the remaining even count normally
+          - Find the last 2v2 match and upgrade it to 3v2 by adding
+            the extra player. If no 2v2 exists, the last match is used
+            (e.g. 7 players produces one 4v3, which is valid in pétanque).
         """
         players = list(player_names)
         random.shuffle(players)
-        bye = None
+        matches  = []
+        is_odd   = len(players) % 2 != 0
+        extra    = players.pop() if is_odd else None
 
-        if len(players) % 2 != 0:
-            bye = players.pop()
-
-        matches = []
-
+        # Create 3v3 matches to handle counts that don't divide cleanly into 2v2
         while len(players) >= 6 and len(players) % 4 != 0:
             p = [players.pop(0) for _ in range(6)]
             matches.append(
@@ -385,8 +392,20 @@ class TournamentEngine:
             p = [players.pop(0) for _ in range(4)]
             matches.append((f"{p[0]} & {p[1]}", f"{p[2]} & {p[3]}"))
 
-        return matches, bye
+        if is_odd and extra and matches:
+            # Prefer upgrading the last 2v2; fall back to the last match if none exists
+            target_idx = len(matches) - 1
+            for i in range(len(matches) - 1, -1, -1):
+                t1, t2 = matches[i]
+                s1 = len([x for x in t1.replace(" & ", ",").split(",") if x.strip()])
+                s2 = len([x for x in t2.replace(" & ", ",").split(",") if x.strip()])
+                if s1 == 2 and s2 == 2:
+                    target_idx = i
+                    break
+            t1, t2 = matches.pop(target_idx)
+            matches.insert(target_idx, (t1, f"{t2} & {extra}"))
 
+        return matches, None
     @staticmethod
     def elimination_bracket(player_names: list[str]) -> tuple[list, list]:
         """
@@ -498,7 +517,7 @@ class PetanqueProMaster:
 
         tk.Label(ctrl, text="Bahnen:").pack(side="left")
         self.entry_lanes = tk.Entry(ctrl, width=4)
-        self.entry_lanes.insert(0, "4")
+        self.entry_lanes.insert(0, "2")
         self.entry_lanes.pack(side="left", padx=5)
 
         tk.Label(ctrl, text="System:").pack(side="left", padx=(10, 2))
@@ -744,18 +763,16 @@ class PetanqueProMaster:
 
     def _generate_melee(self):
         names = self.db.get_all_player_names()
-        if len(names) < 4:
-            messagebox.showwarning("Warnung", "Mindestens 4 Spieler benötigt!")
+        if len(names) < 8:
+            messagebox.showwarning("Warnung", "Super Mêlée benötigt mindestens 8 Spieler!")
             return
         if not self._check_active_round():
             return
 
-        pairs, bye = self.engine.melee_teams(names)
+        pairs, _ = self.engine.melee_teams(names)
 
         with self.db.connect() as conn:
             self.db.clear_matches(conn)
-            if bye:
-                self._apply_bye(conn, bye)
             self._assign_lanes(conn, pairs)
 
         self._refresh_all()
