@@ -21,7 +21,7 @@ The application comes in two versions sharing the same codebase and architecture
 Supports Swiss Ladder, Super Melee, and Single Elimination from a single dropdown. Swiss pairing uses a closest-rank-first algorithm to keep winners playing winners and losers playing losers across rounds, while avoiding rematches where possible. Super Melee randomly mixes players into 2v2 teams, handling odd counts with 3v3 matches so no one is left out. Single Elimination seeds the bracket so top-ranked players meet as late as possible.
 
 **Live Public Dashboard**
-A fullscreen, high-contrast scoreboard designed to be shown on a second screen or projector. Displays a scrolling leaderboard, current lane assignments, the next two waiting matches, and a broadcast message ticker at the bottom. The leaderboard auto-scrolls through all players and refreshes automatically after every score entry.
+A fullscreen, high-contrast scoreboard designed to be shown on a second screen or projector. Displays a scrolling leaderboard, current lane assignments, the next two waiting matches, and a broadcast message ticker at the bottom. The leaderboard auto-scrolls through all players and refreshes automatically after every score entry. An optional "Number of Rounds" field in the Tournament Management panel lets the director set the total round count for the day — once that many rounds are complete, the dashboard's between-rounds banner switches from "Round Finished / Waiting" to "End of Tournament".
 
 **Lane Queue Management**
 Matches are automatically assigned to available lanes. When a match finishes, the next waiting match is promoted to that lane immediately. The dashboard reflects this in real time.
@@ -101,7 +101,7 @@ Die Anwendung ist in zwei Versionen mit gemeinsamer Codebasis verfügbar:
 Über ein Dropdown-Menü wählbar: Schweizer System, Super Mêlée und K.O.-System. Die Auslosung nach dem Schweizer System verwendet einen rangbasierten Algorithmus, der Gewinner möglichst gegen Gewinner und Verlierer gegen Verlierer setzt und dabei Wiederholungsspiele vermeidet. Super Mêlée mischt die Spieler zufällig in 2-gegen-2-Teams; bei ungerader Spielerzahl werden 3-gegen-3-Spiele eingebaut, damit niemand pausieren muss. Das K.O.-System setzt die Spieler so, dass die besten Teams erst in späteren Runden aufeinandertreffen.
 
 **Live-Anzeigetafel**
-Eine Vollbild-Anzeigetafel im hochkontrastreichen Design für Beamer oder zweiten Bildschirm. Zeigt eine automatisch scrollende Rangliste, aktuelle Bahnbelegungen, die nächsten zwei wartenden Spiele sowie einen Durchsage-Banner am unteren Bildschirmrand. Die Rangliste aktualisiert sich nach jeder Ergebniseingabe automatisch.
+Eine Vollbild-Anzeigetafel im hochkontrastreichen Design für Beamer oder zweiten Bildschirm. Zeigt eine automatisch scrollende Rangliste, aktuelle Bahnbelegungen, die nächsten zwei wartenden Spiele sowie einen Durchsage-Banner am unteren Bildschirmrand. Die Rangliste aktualisiert sich nach jeder Ergebniseingabe automatisch. Über das optionale Feld „Anzahl Runden" im Turnier-Management-Bereich kann die Gesamtzahl der Runden für den Tag festgelegt werden — sind alle Runden gespielt, wechselt der Banner zwischen den Spielen von „Runde Beendet" zu „Turnier Beendet".
 
 **Bahnwarteschlange**
 Spiele werden automatisch den verfügbaren Bahnen zugewiesen. Sobald ein Spiel beendet wird, rückt das nächste Wartespiel sofort auf die freie Bahn nach. Die Anzeigetafel spiegelt dies in Echtzeit wider.

@@ -66,6 +66,10 @@ class Database:
                     conn.execute(f"ALTER TABLE history ADD COLUMN {col}")
                 except sqlite3.OperationalError:
                     pass  # Column already exists — safe to ignore
+            try:
+                conn.execute("ALTER TABLE matches ADD COLUMN round_num INTEGER")
+            except sqlite3.OperationalError:
+                pass  # Column already exists — safe to ignore
 
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS players (
@@ -77,11 +81,12 @@ class Database:
                     pa   INTEGER DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS matches (
-                    id      INTEGER PRIMARY KEY,
-                    t1      TEXT,
-                    t2      TEXT,
-                    terrain INTEGER,
-                    status  TEXT
+                    id        INTEGER PRIMARY KEY,
+                    t1        TEXT,
+                    t2        TEXT,
+                    terrain   INTEGER,
+                    status    TEXT,
+                    round_num INTEGER
                 );
                 CREATE TABLE IF NOT EXISTS history (
                     id        INTEGER PRIMARY KEY,
@@ -150,11 +155,15 @@ class Database:
     def clear_matches(self, conn):
         conn.execute("DELETE FROM matches")
 
-    def insert_match(self, conn, t1: str, t2: str, terrain: int, status: str):
+    def insert_match(self, conn, t1: str, t2: str, terrain: int, status: str, round_num: int):
         conn.execute(
-            "INSERT INTO matches (t1, t2, terrain, status) VALUES (?,?,?,?)",
-            (t1, t2, terrain, status)
+            "INSERT INTO matches (t1, t2, terrain, status, round_num) VALUES (?,?,?,?,?)",
+            (t1, t2, terrain, status, round_num)
         )
+
+    def get_match_round(self, conn, match_id: int) -> int:
+        row = conn.execute("SELECT round_num FROM matches WHERE id=?", (match_id,)).fetchone()
+        return row["round_num"] if row and row["round_num"] is not None else self.get_current_round()
 
     def get_matches(self) -> list:
         with self.connect() as conn:
@@ -215,11 +224,11 @@ class Database:
     # -- History --
 
     def add_history(self, conn, match_id: int, terrain: int,
-                    team_a: str, team_b: str, score_a: int, score_b: int):
+                    team_a: str, team_b: str, score_a: int, score_b: int, round_num: int):
         conn.execute(
-            "INSERT INTO history (match_id, terrain, team_a, team_b, score_a, score_b) "
-            "VALUES (?,?,?,?,?,?)",
-            (match_id, terrain, team_a, team_b, score_a, score_b)
+            "INSERT INTO history (match_id, terrain, team_a, team_b, score_a, score_b, round_num) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (match_id, terrain, team_a, team_b, score_a, score_b, round_num)
         )
 
     def get_last_history(self):
@@ -231,6 +240,12 @@ class Database:
 
     def delete_history(self, conn, history_id: int):
         conn.execute("DELETE FROM history WHERE id=?", (history_id,))
+
+    def get_current_round(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute("SELECT MAX(round_num) as r FROM history").fetchone()
+            return (row["r"] or 0) + 1
+
 
     # -- Payments --
 
@@ -498,9 +513,28 @@ class PetanqueProMaster:
 
         row2 = tk.Frame(mgmt)
         row2.pack(fill="x", pady=(10, 0))
+        tk.Label(row2, text="Bahnen:", font=("Arial", 10)).pack(side="left", padx=(5, 2))
+        self.terrain_count = tk.Entry(row2, width=3)
+        self.terrain_count.insert(0, "2")
+        self.terrain_count.pack(side="left", padx=(0, 10))
+ 
+        tk.Label(row2, text="System:", font=("Arial", 10)).pack(side="left", padx=(0, 2))
+        self.tourney_type = ttk.Combobox(
+            row2,
+            values=[TournamentMode.SWISS, TournamentMode.MELEE, TournamentMode.ELIM],
+            state="readonly", width=18
+        )
+        self.tourney_type.set(TournamentMode.SWISS)
+        self.tourney_type.pack(side="left", padx=(0, 10))
 
-        tk.Label(row2, text="📢 DURCHSAGE:", font=("Arial", 10, "bold")).pack(side="left", padx=5)
-        self.announce_entry = tk.Entry(row2, font=("Arial", 12), fg="blue")
+        tk.Label(row2, text="Anzahl Runden:", font=("Arial", 10)).pack(side="left", padx=(0, 2))
+        self.num_rounds_entry = tk.Entry(row2, width=3)
+        self.num_rounds_entry.pack(side="left", padx=(0, 10))
+
+        row3 = tk.Frame(mgmt)
+        row3.pack(fill="x", pady=(10, 0))
+        tk.Label(row3, text="📢 DURCHSAGE:", font=("Arial", 10, "bold")).pack(side="left", padx=5)
+        self.announce_entry = tk.Entry(row3, font=("Arial", 12), fg="blue")
         self.announce_entry.pack(side="left", fill="x", expand=True, padx=10)
         self.announce_entry.insert(0, "Willkommen zum Turnier!")
 
@@ -514,20 +548,6 @@ class PetanqueProMaster:
     def _build_tab2(self):
         ctrl = tk.LabelFrame(self.tab2, text="Steuerung", padx=10, pady=10)
         ctrl.pack(fill="x")
-
-        tk.Label(ctrl, text="Bahnen:").pack(side="left")
-        self.entry_lanes = tk.Entry(ctrl, width=4)
-        self.entry_lanes.insert(0, "2")
-        self.entry_lanes.pack(side="left", padx=5)
-
-        tk.Label(ctrl, text="System:").pack(side="left", padx=(10, 2))
-        self.tourney_type = ttk.Combobox(
-            ctrl,
-            values=[TournamentMode.SWISS, TournamentMode.MELEE, TournamentMode.ELIM],
-            state="readonly", width=16
-        )
-        self.tourney_type.set(TournamentMode.SWISS)
-        self.tourney_type.pack(side="left", padx=5)
 
         tk.Button(ctrl, text="AUSLOSEN",        command=self._generate_draw,
                   bg="#3498db", font=("Arial", 10, "bold")).pack(side="left", padx=10)
@@ -705,11 +725,18 @@ class PetanqueProMaster:
     # Draw / Pairing
     # -----------------------------------------------------------------------
 
-    def _max_lanes(self) -> int:
+    def _max_terrains(self) -> int:
         try:
-            return int(self.entry_lanes.get())
+            return int(self.terrain_count.get())
         except ValueError:
-            return 4
+            return 2
+
+    def _target_rounds(self) -> int | None:
+        try:
+            n = int(self.num_rounds_entry.get())
+            return n if n > 0 else None
+        except ValueError:
+            return None
 
     def _check_active_round(self) -> bool:
         """Returns True if safe to proceed (no active round, or user confirmed override)."""
@@ -720,13 +747,13 @@ class PetanqueProMaster:
             )
         return True
 
-    def _assign_lanes(self, conn, pairs: list[tuple[str, str]]):
+    def _assign_lanes(self, conn, pairs: list[tuple[str, str]], round_num: int):
         """Insert match rows, assigning lanes to the first N matches."""
-        max_t = self._max_lanes()
+        max_t = self._max_terrains()
         for i, (t1, t2) in enumerate(pairs, 1):
             terrain = i if i <= max_t else 0
             status  = MatchStatus.PLAYING if i <= max_t else MatchStatus.WAITING
-            self.db.insert_match(conn, t1, t2, terrain, status)
+            self.db.insert_match(conn, t1, t2, terrain, status, round_num)
 
     def _apply_bye(self, conn, bye: str):
         conn.execute(
@@ -743,6 +770,15 @@ class PetanqueProMaster:
         }
         dispatch[mode]()
 
+    def _assign_terrains(self, conn, pairs: list[tuple[str, str]], round_num: int):
+        """Insert match rows, assigning terrains to the first N matches."""
+        max_t = self._max_terrains()
+        for i, (t1, t2) in enumerate(pairs, 1):
+            if i <= max_t:
+                self.db.insert_match(conn, t1, t2, i, MatchStatus.PLAYING, round_num)
+            else:
+                self.db.insert_match(conn, t1, t2, 0, MatchStatus.WAITING, round_num)
+
     def _generate_swiss(self):
         names = self.db.get_all_player_names()
         if len(names) < 2:
@@ -753,11 +789,24 @@ class PetanqueProMaster:
 
         with self.db.connect() as conn:
             def played(a, b): return self.db.played_before(conn, a, b)
-            pairs, bye = self.engine.swiss_pairs(names, played)
+
+            round_num = self.db.get_current_round()
+
+            # Round 1: pair randomly so entry order can't influence matchups
+            if round_num == 1:
+                random.shuffle(names)
+                bye = names.pop() if len(names) % 2 != 0 else None
+                pairs = [(names[i], names[i + 1]) for i in range(0, len(names), 2)]
+            else:
+                pairs, bye = self.engine.swiss_pairs(names, played)
+
             self.db.clear_matches(conn)
             if bye:
-                self._apply_bye(conn, bye)
-            self._assign_lanes(conn, pairs)
+                conn.execute(
+                    "UPDATE players SET wins=wins+1, pf=pf+13, diff=diff+13 WHERE name=?", (bye,)
+                )
+                messagebox.showinfo("BYE", f"{bye} bekommt eine BYE (13–0 win).")
+            self._assign_terrains(conn, pairs, round_num)
 
         self._refresh_all()
 
@@ -772,8 +821,9 @@ class PetanqueProMaster:
         pairs, _ = self.engine.melee_teams(names)
 
         with self.db.connect() as conn:
+            round_num = self.db.get_current_round()
             self.db.clear_matches(conn)
-            self._assign_lanes(conn, pairs)
+            self._assign_lanes(conn, pairs, round_num)
 
         self._refresh_all()
 
@@ -788,11 +838,12 @@ class PetanqueProMaster:
         pairs, byes = self.engine.elimination_bracket(names)
 
         with self.db.connect() as conn:
+            round_num = self.db.get_current_round()
             self.db.clear_matches(conn)
             for bye in byes:
                 if bye:
                     self._apply_bye(conn, bye)
-            self._assign_lanes(conn, pairs)
+            self._assign_lanes(conn, pairs, round_num)
 
         if byes:
             names_str = ", ".join(b for b in byes if b)
@@ -841,13 +892,14 @@ class PetanqueProMaster:
     def _record_score(self, match_id: int, terrain: int,
                       t1: str, t2: str, s1: int, s2: int):
         with self.db.connect() as conn:
+            round_num = self.db.get_match_round(conn, match_id)
             for name in split_team(t1):
                 self.db.update_player_stats(conn, name, s1, s2, 1 if s1 > s2 else 0)
             for name in split_team(t2):
                 self.db.update_player_stats(conn, name, s2, s1, 1 if s2 > s1 else 0)
 
             # Store terrain in history so undo can restore the exact lane
-            self.db.add_history(conn, match_id, terrain, t1, t2, s1, s2)
+            self.db.add_history(conn, match_id, terrain, t1, t2, s1, s2, round_num)
 
             self.db.finish_match(conn, match_id)
             if terrain > 0:
@@ -969,7 +1021,7 @@ class PetanqueProMaster:
         self._dash_msg.pack(side="bottom", fill="x")
 
         # Standings tree — takes all remaining space
-        txt_height = self._max_lanes() + 2
+        txt_height = self._max_terrains() + 2
 
         self._dash_tree = ttk.Treeview(self._dash,
                                        columns=("rank", "name", "wins", "diff"),
@@ -1047,7 +1099,12 @@ class PetanqueProMaster:
             for w in waiting:
                 self._dash_match_text.insert("end", f"  ⏳  {w['t1']}  vs  {w['t2']}\n")
         else:
-            self._dash_match_text.insert("end", "\n— RUNDE BEENDET —")
+            target = self._target_rounds()
+            completed = self.db.get_current_round() - 1
+            if target and completed >= target:
+                self._dash_match_text.insert("end", "\n— TURNIER BEENDET —")
+            else:
+                self._dash_match_text.insert("end", "\n— RUNDE BEENDET —")
         self._dash_match_text.tag_add("center", "1.0", "end")
         self._dash_match_text.tag_configure("center", justify="center")
         self._dash_match_text.config(state="disabled")

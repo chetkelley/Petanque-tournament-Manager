@@ -73,6 +73,10 @@ class Database:
                     conn.execute(f"ALTER TABLE history ADD COLUMN {col}")
                 except Exception:
                     pass  # Column already exists — safe to ignore
+            try:
+                conn.execute("ALTER TABLE matches ADD COLUMN round_num INTEGER")
+            except Exception:
+                pass  # Column already exists — safe to ignore
 
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS players (
@@ -84,11 +88,12 @@ class Database:
                     diff INTEGER DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS matches (
-                    id      INTEGER PRIMARY KEY,
-                    t1      TEXT,
-                    t2      TEXT,
-                    terrain INTEGER,
-                    status  TEXT
+                    id        INTEGER PRIMARY KEY,
+                    t1        TEXT,
+                    t2        TEXT,
+                    terrain   INTEGER,
+                    status    TEXT,
+                    round_num INTEGER
                 );
                 CREATE TABLE IF NOT EXISTS history (
                     id        INTEGER PRIMARY KEY,
@@ -163,11 +168,15 @@ class Database:
             with self.connect() as c:
                 _do(c)
 
-    def insert_match(self, conn, t1: str, t2: str, terrain: int, status: str):
+    def insert_match(self, conn, t1: str, t2: str, terrain: int, status: str, round_num: int):
         conn.execute(
-            "INSERT INTO matches (t1, t2, terrain, status) VALUES (?,?,?,?)",
-            (t1, t2, terrain, status)
+            "INSERT INTO matches (t1, t2, terrain, status, round_num) VALUES (?,?,?,?,?)",
+            (t1, t2, terrain, status, round_num)
         )
+
+    def get_match_round(self, conn, match_id: int) -> int:
+        row = conn.execute("SELECT round_num FROM matches WHERE id=?", (match_id,)).fetchone()
+        return row["round_num"] if row and row["round_num"] is not None else self.get_current_round()
 
     def get_matches(self) -> list:
         with self.connect() as conn:
@@ -490,7 +499,7 @@ class PetanqueProMaster:
         self.tab_standings = tk.Frame(self.tabs, padx=20, pady=20)
         self.tab_matches   = tk.Frame(self.tabs, padx=20, pady=20)
         self.tab_payments  = tk.Frame(self.tabs, padx=20, pady=20)
-        self.tabs.add(self.tab_standings, text=" 1. Leaderboard ")
+        self.tabs.add(self.tab_standings, text=" 1. Admin & Leaderboard ")
         self.tabs.add(self.tab_matches,   text=" 2. Live Matches & Draw ")
         self.tabs.add(self.tab_payments,  text=" 3. Entry Fees ")
         self.tabs.pack(expand=True, fill="both")
@@ -516,19 +525,41 @@ class PetanqueProMaster:
 
         tk.Button(row1, text="RESET DATA",          fg="red",     command=self._reset_tournament ).pack(side="right", padx=2)
         tk.Button(row1, text="EXPORT TO EXCEL",      bg="#27ae60", command=self._export_to_excel  ).pack(side="right", padx=5)
-        tk.Button(row1, text="OPEN PUBLIC DASHBOARD",bg="#ecf0f1", fg="#00008B",
+        tk.Button(row1, text="OPEN DASHBOARD",bg="#ecf0f1", fg="#00008B",
                   font=("Arial", 10, "bold"),        command=self._open_dashboard              ).pack(side="right", padx=5)
 
-        # Row 2 — broadcast message
+        # Row 2 — lanes, system, and generate controls
         row2 = tk.Frame(mgmt)
         row2.pack(fill="x", pady=(10, 0))
+ 
+        tk.Label(row2, text="Lanes:", font=("Arial", 10)).pack(side="left", padx=(5, 2))
+        self.terrain_count = tk.Entry(row2, width=3)
+        self.terrain_count.insert(0, "2")
+        self.terrain_count.pack(side="left", padx=(0, 10))
+ 
+        tk.Label(row2, text="System:", font=("Arial", 10)).pack(side="left", padx=(0, 2))
+        self.tourney_type = ttk.Combobox(
+            row2,
+            values=[TournamentMode.SWISS, TournamentMode.MELEE, TournamentMode.ELIM],
+            state="readonly", width=18
+        )
+        self.tourney_type.set(TournamentMode.SWISS)
+        self.tourney_type.pack(side="left", padx=(0, 10))
 
-        tk.Label(row2, text="📢 BROADCAST MESSAGE:", font=("Arial", 10, "bold")).pack(side="left", padx=5)
-        self.announce_entry = tk.Entry(row2, font=("Arial", 12), fg="blue")
+        tk.Label(row2, text="Number of Rounds:", font=("Arial", 10)).pack(side="left", padx=(0, 2))
+        self.num_rounds_entry = tk.Entry(row2, width=3)
+        self.num_rounds_entry.pack(side="left", padx=(0, 10))
+
+        # Row 3 — broadcast message
+        row3 = tk.Frame(mgmt)
+        row3.pack(fill="x", pady=(10, 0))
+ 
+        tk.Label(row3, text="📢 BROADCAST MESSAGE:", font=("Arial", 10, "bold")).pack(side="left", padx=5)
+        self.announce_entry = tk.Entry(row3, font=("Arial", 12), fg="blue")
         self.announce_entry.pack(side="left", fill="x", expand=True, padx=10)
         self.announce_entry.insert(0, "Welcome to the Tournament!")
         self.announce_entry.bind("<Return>", lambda _e: self._update_dashboard())
-        tk.Label(row2, text="(Press Enter to update dashboard)", font=("Arial", 8), fg="gray").pack(side="left")
+        tk.Label(row3, text="(Press Enter to update dashboard)", font=("Arial", 8), fg="gray").pack(side="left")
 
         # Standings treeview
         cols = ("Rank", "Team Name", "Wins", "Points For", "Points Against", "Net Diff")
@@ -542,22 +573,8 @@ class PetanqueProMaster:
         ctrl = tk.LabelFrame(self.tab_matches, text="Tournament Control", padx=5, pady=5)
         ctrl.pack(fill="x")
 
-        tk.Label(ctrl, text="Lanes:").grid(row=0, column=0, padx=2)
-        self.terrain_count = tk.Entry(ctrl, width=3)
-        self.terrain_count.insert(0, "2")
-        self.terrain_count.grid(row=0, column=1, padx=2)
-
-        tk.Label(ctrl, text="System:").grid(row=0, column=2, padx=5)
-        self.tourney_type = ttk.Combobox(
-            ctrl,
-            values=[TournamentMode.SWISS, TournamentMode.MELEE, TournamentMode.ELIM],
-            state="readonly", width=16
-        )
-        self.tourney_type.set(TournamentMode.SWISS)
-        self.tourney_type.grid(row=0, column=3, padx=2)
-
-        tk.Button(ctrl, text="GENERATE",  command=self._handle_draw,
-                  bg="#3498db", fg="black", font=("Arial", 10, "bold")).grid(row=0, column=4, padx=5)
+        tk.Button(ctrl, text="Generate Matches",  command=self._handle_draw,
+                  fg="#3498db").grid(row=0, column=4, padx=5)
         tk.Button(ctrl, text="UNDO LAST", command=self._undo_last_score,
                   bg="#f39c12", fg="black").grid(row=0, column=5, padx=5)
         tk.Label(ctrl, text="(Double-click match to enter score)",
@@ -764,14 +781,21 @@ class PetanqueProMaster:
         except ValueError:
             return 3
 
-    def _assign_terrains(self, conn, pairs: list[tuple[str, str]]):
+    def _target_rounds(self) -> int | None:
+        try:
+            n = int(self.num_rounds_entry.get())
+            return n if n > 0 else None
+        except ValueError:
+            return None
+
+    def _assign_terrains(self, conn, pairs: list[tuple[str, str]], round_num: int):
         """Insert match rows, assigning terrains to the first N matches."""
         max_t = self._max_terrains()
         for i, (t1, t2) in enumerate(pairs, 1):
             if i <= max_t:
-                self.db.insert_match(conn, t1, t2, i, MatchStatus.PLAYING)
+                self.db.insert_match(conn, t1, t2, i, MatchStatus.PLAYING, round_num)
             else:
-                self.db.insert_match(conn, t1, t2, 0, MatchStatus.WAITING)
+                self.db.insert_match(conn, t1, t2, 0, MatchStatus.WAITING, round_num)
 
     def _generate_swiss(self):
         names = self.db.get_all_player_names()
@@ -783,18 +807,24 @@ class PetanqueProMaster:
 
         with self.db.connect() as conn:
             def played(a, b): return self.db.played_before(conn, a, b)
-            pairs, bye = self.engine.swiss_pairs(names, played)
 
+            round_num = self.db.get_current_round()
+
+            # Round 1: pair randomly so entry order can't influence matchups
+            if round_num == 1:
+                random.shuffle(names)
+                bye = names.pop() if len(names) % 2 != 0 else None
+                pairs = [(names[i], names[i + 1]) for i in range(0, len(names), 2)]
+            else:
+                pairs, bye = self.engine.swiss_pairs(names, played)
+
+            self.db.clear_matches(conn)
             if bye:
-                self.db.clear_matches(conn)
                 conn.execute(
                     "UPDATE players SET wins=wins+1, pf=pf+13, diff=diff+13 WHERE name=?", (bye,)
                 )
                 messagebox.showinfo("BYE", f"{bye} receives a BYE (13–0 win).")
-            else:
-                self.db.clear_matches(conn)
-
-            self._assign_terrains(conn, pairs)
+            self._assign_terrains(conn, pairs, round_num)
 
         self._refresh_all()
 
@@ -809,8 +839,9 @@ class PetanqueProMaster:
         pairs, _ = self.engine.melee_teams(names)
 
         with self.db.connect() as conn:
+            round_num = self.db.get_current_round()
             self.db.clear_matches(conn)
-            self._assign_terrains(conn, pairs)
+            self._assign_terrains(conn, pairs, round_num)
 
         self._refresh_all()
 
@@ -825,15 +856,15 @@ class PetanqueProMaster:
         pairs, byes = self.engine.elimination_bracket(names)
 
         with self.db.connect() as conn:
-            self.db.clear_matches(conn)
             round_num = self.db.get_current_round()
+            self.db.clear_matches(conn)
             for bye in byes:
                 if bye:
                     conn.execute(
                         "UPDATE players SET wins=wins+1, pf=pf+13, diff=diff+13 WHERE name=?", (bye,)
                     )
                     self.db.add_history(conn, bye, "BYE", 13, 0, round_num)
-            self._assign_terrains(conn, pairs)
+            self._assign_terrains(conn, pairs, round_num)
 
         if byes:
             names_str = ", ".join(b for b in byes if b)
@@ -880,8 +911,8 @@ class PetanqueProMaster:
 
     def _record_score(self, match_id: int, terrain: int,
                       t1: str, t2: str, s1: int, s2: int):
-        round_num = self.db.get_current_round()
         with self.db.connect() as conn:
+            round_num = self.db.get_match_round(conn, match_id)
             # Update individual player stats
             for name in split_team(t1):
                 self.db.update_player_stats(conn, name, s1, s2, 1 if s1 > s2 else 0)
@@ -997,11 +1028,11 @@ class PetanqueProMaster:
                         fieldbackground="#1a1a1a",
                         font=(main_font, 32), rowheight=55)
         style.configure("Dash.Treeview.Heading",
-                        background="#003366", foreground="#FFFFFF",
+                        background="#003366", foreground="#000000",
                         font=(main_font, 22, "bold"))
         style.map("Dash.Treeview.Heading",
                   background=[("active", "#003366"), ("!disabled", "#003366")],
-                  foreground=[("active", "#FFFFFF"), ("!disabled", "#FFFFFF")])
+                  foreground=[("active", "#000000"), ("!disabled", "#000000")])
         style.map("Dash.Treeview",
                   foreground=[("selected", "white"),  ("!disabled", "white")],
                   background=[("selected", "#34495e"), ("!disabled", "#1a1a1a")])
@@ -1134,7 +1165,12 @@ class PetanqueProMaster:
                     "end", f"  ⏳   {w['t1']}   vs   {w['t2']}\n"
                 )
         else:
-            self._dash_match_text.insert("end", "\n\n— ROUND FINISHED / WAITING —")
+            target = self._target_rounds()
+            completed = self.db.get_current_round() - 1
+            if target and completed >= target:
+                self._dash_match_text.insert("end", "\n\n— END OF TOURNAMENT —")
+            else:
+                self._dash_match_text.insert("end", "\n\n— ROUND FINISHED / WAITING —")
 
         self._dash_match_text.tag_add("center", "1.0", "end")
         self._dash_match_text.tag_configure("center", justify="center", spacing1=15)
