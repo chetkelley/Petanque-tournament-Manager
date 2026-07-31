@@ -883,6 +883,11 @@ class PetanqueProMaster:
         def save():
             try:
                 s1, s2   = map(int, entry.get().replace(" ", "").split("-"))
+                if s1 > 13 or s2 > 13:
+                    messagebox.showerror(
+                        "Ungültiges Ergebnis", "Boule wird bis 13 Punkte gespielt – der Punktestand darf 13 nicht überschreiten.", parent=pop
+                    )
+                    return
                 match_id = int(v[0])
                 terrain  = int(v[1]) if v[1] != "-" else 0
                 self._record_score(match_id, terrain, v[2], v[4], s1, s2)

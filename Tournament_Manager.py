@@ -908,6 +908,11 @@ class PetanqueProMaster:
             try:
                 raw = entry.get().replace(" ", "")
                 s1, s2 = map(int, raw.split("-"))
+                if s1 > 13 or s2 > 13:
+                    messagebox.showerror(
+                        "Invalid Score", "Boule is played to 13 points — scores cannot exceed 13.", parent=pop
+                    )
+                    return
                 self._record_score(int(val[0]), int(val[1]), val[2], val[4], s1, s2)
                 pop.destroy()
             except (ValueError, AttributeError):
@@ -1012,6 +1017,10 @@ class PetanqueProMaster:
     def _dash_is_alive(self) -> bool:
         return self._dash is not None and self._dash.winfo_exists()
 
+    def _toggle_dashboard_fullscreen(self, _event=None):
+        is_full = self._dash.attributes("-fullscreen")
+        self._dash.attributes("-fullscreen", not is_full)
+
     def _open_dashboard(self):
         # If already open, just bring it to front
         if self._dash_is_alive():
@@ -1022,10 +1031,13 @@ class PetanqueProMaster:
         self._dash.title("OFFICIAL TOURNAMENT SCOREBOARD")
         self._dash.configure(bg="#000000")
         self._dash.protocol("WM_DELETE_WINDOW", self._close_dashboard)
-        # Set a large default geometry so exiting fullscreen restores to a usable size
+
+        # Open as a normal, movable window so it can be dragged to an external
+        # monitor first. Press F11 to go fullscreen once it's on the right screen.
         self._dash.geometry("1400x900")
         self._dash.minsize(900, 600)
-        self._dash.attributes("-fullscreen", True)
+        self._dash.bind("<F11>", self._toggle_dashboard_fullscreen)
+        self._dash.bind("<Escape>", lambda _e: self._dash.attributes("-fullscreen", False))
 
         main_font = "Helvetica Neue"
         style     = ttk.Style()
