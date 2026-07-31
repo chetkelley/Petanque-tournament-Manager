@@ -117,6 +117,8 @@ SQLite-Datenbank speichert Spielerstatistiken, Spielergebnisse, Verlauf und Zahl
 
 ### Erste Schritte
 
+**Ohne Python:** Für Windows-Nutzer ohne installiertes Python wird bei jedem Push nach `main` automatisch eine fertige `.exe` gebaut. Die aktuellste Version findest du unter [GitHub Actions – Build Windows EXE](https://github.com/chetkelley/Petanque-tournament-Manager/actions/workflows/build.yml): den neuesten erfolgreichen Lauf öffnen und die Datei im Abschnitt „Artifacts" herunterladen.
+
 **Voraussetzungen:** Python 3.10+, pandas, Pillow, openpyxl
 
 **Installation:**
