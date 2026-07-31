@@ -871,6 +871,9 @@ class PetanqueProMaster:
         pop = tk.Toplevel(self.root)
         pop.title("Ergebniseingabe")
         pop.geometry("300x180")
+        pop.transient(self.root)
+        pop.lift()
+        pop.focus_force()
         pop.grab_set()
 
         tk.Label(pop, text=f"{v[2]}  vs  {v[4]}", font=("Arial", 10, "bold")).pack(pady=10)
