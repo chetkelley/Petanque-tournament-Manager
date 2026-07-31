@@ -141,7 +141,7 @@ class Database:
     def apply_bye(self, name: str):
         with self.connect() as conn:
             conn.execute(
-                "UPDATE players SET wins=wins+1, pf=pf+13, diff=diff+13 WHERE name=?",
+                "UPDATE players SET wins=wins+1, pf=pf+13, diff=diff+6 WHERE name=?",
                 (name,)
             )
 
@@ -797,6 +797,11 @@ class PetanqueProMaster:
             else:
                 self.db.insert_match(conn, t1, t2, 0, MatchStatus.WAITING, round_num)
 
+    def _apply_bye(self, conn, bye: str, round_num: int):
+        self.db.update_player_stats(conn, bye, 13, 7, 1)
+        self.db.add_history(conn, None, 0, bye, "BYE", 13, 7, round_num)
+        messagebox.showinfo("BYE", f"{bye} receives a BYE (13–7 win).")
+
     def _generate_swiss(self):
         names = self.db.get_all_player_names()
         if len(names) < 2:
@@ -820,10 +825,7 @@ class PetanqueProMaster:
 
             self.db.clear_matches(conn)
             if bye:
-                conn.execute(
-                    "UPDATE players SET wins=wins+1, pf=pf+13, diff=diff+13 WHERE name=?", (bye,)
-                )
-                messagebox.showinfo("BYE", f"{bye} receives a BYE (13–0 win).")
+                self._apply_bye(conn, bye, round_num)
             self._assign_terrains(conn, pairs, round_num)
 
         self._refresh_all()
@@ -860,10 +862,7 @@ class PetanqueProMaster:
             self.db.clear_matches(conn)
             for bye in byes:
                 if bye:
-                    conn.execute(
-                        "UPDATE players SET wins=wins+1, pf=pf+13, diff=diff+13 WHERE name=?", (bye,)
-                    )
-                    self.db.add_history(conn, bye, "BYE", 13, 0, round_num)
+                    self._apply_bye(conn, bye, round_num)
             self._assign_terrains(conn, pairs, round_num)
 
         if byes:

@@ -755,11 +755,10 @@ class PetanqueProMaster:
             status  = MatchStatus.PLAYING if i <= max_t else MatchStatus.WAITING
             self.db.insert_match(conn, t1, t2, terrain, status, round_num)
 
-    def _apply_bye(self, conn, bye: str):
-        conn.execute(
-            "UPDATE players SET wins=wins+1, pf=pf+13, diff=diff+13 WHERE name=?", (bye,)
-        )
-        messagebox.showinfo("Freilos", f"{bye} erhält ein Freilos (13:0 Sieg).")
+    def _apply_bye(self, conn, bye: str, round_num: int):
+        self.db.update_player_stats(conn, bye, 13, 7, 1)
+        self.db.add_history(conn, None, 0, bye, "Freilos", 13, 7, round_num)
+        messagebox.showinfo("Freilos", f"{bye} erhält ein Freilos (13:7 Sieg).")
 
     def _generate_draw(self):
         mode = self.tourney_type.get()
@@ -802,10 +801,7 @@ class PetanqueProMaster:
 
             self.db.clear_matches(conn)
             if bye:
-                conn.execute(
-                    "UPDATE players SET wins=wins+1, pf=pf+13, diff=diff+13 WHERE name=?", (bye,)
-                )
-                messagebox.showinfo("BYE", f"{bye} bekommt eine BYE (13–0 win).")
+                self._apply_bye(conn, bye, round_num)
             self._assign_terrains(conn, pairs, round_num)
 
         self._refresh_all()
@@ -842,12 +838,12 @@ class PetanqueProMaster:
             self.db.clear_matches(conn)
             for bye in byes:
                 if bye:
-                    self._apply_bye(conn, bye)
+                    self._apply_bye(conn, bye, round_num)
             self._assign_lanes(conn, pairs, round_num)
 
         if byes:
             names_str = ", ".join(b for b in byes if b)
-            messagebox.showinfo("Freilos", f"Freilose in der ersten Runde: {names_str}")
+            messagebox.showinfo("Freilos", f"Freilos in der ersten Runde: {names_str}")
 
         self._refresh_all()
 
