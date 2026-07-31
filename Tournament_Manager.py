@@ -758,6 +758,14 @@ class PetanqueProMaster:
     # -----------------------------------------------------------------------
 
     def _handle_draw(self):
+        target = self._target_rounds()
+        if target and self.db.get_current_round() - 1 >= target:
+            if not messagebox.askyesno(
+                "Tournament Complete",
+                f"The {target}-round limit has already been reached. Generate an additional round anyway?"
+            ):
+                return
+
         mode = self.tourney_type.get()
         dispatch = {
             TournamentMode.SWISS: self._generate_swiss,

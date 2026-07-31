@@ -761,6 +761,14 @@ class PetanqueProMaster:
         messagebox.showinfo("Freilos", f"{bye} erhält ein Freilos (13:7 Sieg).")
 
     def _generate_draw(self):
+        target = self._target_rounds()
+        if target and self.db.get_current_round() - 1 >= target:
+            if not messagebox.askyesno(
+                "Turnier beendet",
+                f"Das Rundenlimit von {target} wurde bereits erreicht. Trotzdem eine weitere Runde auslosen?"
+            ):
+                return
+
         mode = self.tourney_type.get()
         dispatch = {
             TournamentMode.SWISS: self._generate_swiss,
