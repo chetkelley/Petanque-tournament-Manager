@@ -358,45 +358,81 @@ class TournamentEngine:
     """Pure pairing logic — no UI, no DB writes (returns data for caller to persist)."""
 
     @staticmethod
-    def swiss_pairs(player_names: list[str], already_played_fn) -> tuple[list, str | None]:
+    def swiss_pairs(
+        players_with_wins: list[tuple[str, int]], already_played_fn, prioritize_middle: bool = False
+    ) -> tuple[list, str | None]:
         """
         Return (pairs, bye_player_or_None).
         pairs = [(t1, t2), ...]
 
-        Pairing strategy: players arrive pre-sorted by rank (wins DESC, diff DESC).
-        For each unpaired player, find the closest-ranked opponent they haven't
-        already faced. Only fall back to a rematch if no fresh opponent exists.
-        This keeps winners playing winners and losers playing losers as fairly
-        as possible while still avoiding rematches.
+        players_with_wins: [(name, wins), ...] — players group into brackets by
+        win count (consecutive equal-wins runs, so the caller should sort by wins
+        DESC first). Within each bracket, opponents are chosen at random rather
+        than by rank order, avoiding rematches where possible. If a bracket has
+        an odd number of players, one is carried down into the next-lower
+        bracket to be paired there — cascading further down if that in turn
+        makes the next bracket odd. Only the very last leftover player (if the
+        total player count is odd) becomes the bye.
+
+        prioritize_middle: for the final round, list order determines lane
+        assignment order (earlier pairs get a lane immediately, later ones queue
+        as Waiting) — so when set, pairs are reordered so the middle bracket(s)
+        come first and the top/bottom brackets (the most suspenseful matches)
+        are queued last.
         """
-        players = list(player_names)
-        bye = None
+        brackets: list[list[str]] = []
+        current_wins = object()  # sentinel that won't equal any real win count
+        for name, wins in players_with_wins:
+            if wins != current_wins:
+                brackets.append([])
+                current_wins = wins
+            brackets[-1].append(name)
 
-        if len(players) % 2 != 0:
-            bye = players.pop()
+        tagged_pairs: list[tuple[int, tuple]] = []
+        carry: list[str] = []
 
-        paired   = []
-        unpaired = list(players)
+        for bracket_idx, bracket in enumerate(brackets):
+            pool = carry + bracket
+            random.shuffle(pool)
 
-        while len(unpaired) >= 2:
-            t1 = unpaired.pop(0)
+            carry = [pool.pop()] if len(pool) % 2 != 0 else []
 
-            # Search the remaining list in order (closest rank first).
-            # Accept the first opponent t1 hasn't played before.
-            best_idx = None
-            for i, candidate in enumerate(unpaired):
-                if not already_played_fn(t1, candidate):
-                    best_idx = i
-                    break  # first = closest rank — stop immediately
+            for pair in TournamentEngine._pair_pool_avoiding_rematches(pool, already_played_fn):
+                tagged_pairs.append((bracket_idx, pair))
 
-            if best_idx is not None:
-                paired.append((t1, unpaired.pop(best_idx)))
-            else:
-                # Every remaining opponent is a rematch — accept the closest
-                # ranked one (index 0) rather than a random pick
-                paired.append((t1, unpaired.pop(0)))
+        if prioritize_middle and len(brackets) > 2:
+            last = len(brackets) - 1
+            # Smaller key = further from the edges = played earlier
+            tagged_pairs.sort(key=lambda tp: -min(tp[0], last - tp[0]))
 
-        return paired, bye
+        bye = carry[0] if carry else None
+        return [pair for _, pair in tagged_pairs], bye
+
+    @staticmethod
+    def _pair_pool_avoiding_rematches(pool: list[str], already_played_fn, attempts: int = 30) -> list[tuple]:
+        """Randomly pair up an even-sized pool, retrying several shuffles to
+        find a pairing with no rematches where one exists — a single greedy
+        pass can paint one player into a forced rematch even when a
+        rematch-free pairing of the whole pool was available."""
+        best_pairs, best_rematches = None, None
+
+        for _ in range(attempts):
+            working = pool[:]
+            random.shuffle(working)
+            pairs = []
+            while len(working) >= 2:
+                t1 = working.pop(0)
+                candidates = [i for i, c in enumerate(working) if not already_played_fn(t1, c)]
+                idx = random.choice(candidates) if candidates else 0
+                pairs.append((t1, working.pop(idx)))
+
+            rematches = sum(1 for t1, t2 in pairs if already_played_fn(t1, t2))
+            if rematches == 0:
+                return pairs
+            if best_rematches is None or rematches < best_rematches:
+                best_pairs, best_rematches = pairs, rematches
+
+        return best_pairs or []
 
     @staticmethod
     def melee_teams(player_names: list[str]) -> tuple[list, str | None]:
@@ -829,7 +865,11 @@ class PetanqueProMaster:
                 bye = names.pop() if len(names) % 2 != 0 else None
                 pairs = [(names[i], names[i + 1]) for i in range(0, len(names), 2)]
             else:
-                pairs, bye = self.engine.swiss_pairs(names, played)
+                standings = self.db.get_standings()
+                players_with_wins = [(r["name"], r["wins"]) for r in standings]
+                target = self._target_rounds()
+                is_final_round = target is not None and round_num >= target
+                pairs, bye = self.engine.swiss_pairs(players_with_wins, played, prioritize_middle=is_final_round)
 
             self.db.clear_matches(conn)
             if bye:
@@ -1044,24 +1084,40 @@ class PetanqueProMaster:
 
         main_font = "Helvetica Neue"
         style     = ttk.Style()
-        style.theme_use("aqua")
+        # "clam" (not "aqua") so per-row tag background colors actually render —
+        # macOS's native aqua theme draws Treeview rows itself and ignores tag
+        # background colors, which would silently break the striping below
+        style.theme_use("clam")
         style.configure("Dash.Treeview",
                         background="#1a1a1a", foreground="white",
                         fieldbackground="#1a1a1a",
                         font=(main_font, 32), rowheight=55)
         style.configure("Dash.Treeview.Heading",
-                        background="#003366", foreground="#000000",
+                        background="#003366", foreground="white",
                         font=(main_font, 22, "bold"))
         style.map("Dash.Treeview.Heading",
                   background=[("active", "#003366"), ("!disabled", "#003366")],
-                  foreground=[("active", "#000000"), ("!disabled", "#000000")])
+                  foreground=[("active", "white"), ("!disabled", "white")])
+        # No "!disabled" background entry here — mapping it to a fixed color
+        # overrides every row's tag_configure background (below), which is what
+        # was making the alternating stripe colors render as solid black
         style.map("Dash.Treeview",
                   foreground=[("selected", "white"),  ("!disabled", "white")],
-                  background=[("selected", "#34495e"), ("!disabled", "#1a1a1a")])
+                  background=[("selected", "#34495e")])
+
+        # Top-level layout uses grid with weighted rows so the leaderboard and the
+        # lane-assignments panel below it genuinely share the window on resize,
+        # instead of one being pinned to a fixed size while the other absorbs all
+        # the extra/lost space.
+        self._dash.columnconfigure(0, weight=1)
+        self._dash.rowconfigure(0, weight=0)  # header — fixed
+        self._dash.rowconfigure(1, weight=3)  # leaderboard — 60% of the split
+        self._dash.rowconfigure(2, weight=2)  # lane assignments — 40% (20% smaller than even)
+        self._dash.rowconfigure(3, weight=0)  # announcement bar — fixed
 
         # Header
         header = tk.Frame(self._dash, bg="#000000")
-        header.pack(fill="x", pady=20)
+        header.grid(row=0, column=0, sticky="ew", pady=20)
 
         tk.Label(header, text="🏆 LEADERBOARD",
                  font=(main_font, 28, "bold"),
@@ -1084,57 +1140,68 @@ class PetanqueProMaster:
                                     bg="#000000", fg="#00FF00")
         self._dash_clock.pack(side="right", padx=20)
 
-        # Announcement bar (bottom — packed first so it always stays pinned)
-        self._dash_msg = tk.Label(self._dash, text="WELCOME!",
-                                  font=(main_font, 36, "bold"),
-                                  bg="#c0392b", fg="white", pady=10)
-        self._dash_msg.pack(side="bottom", fill="x")
-
-        # Bottom section — fixed pixel height so font size doesn't affect sizing
-        # Mac renders Helvetica Neue 32 bold at ~62px per line; label + padding ~80px extra
-        line_px   = 62
-        pad_px    = 80
-        n_lines   = self._max_terrains() + 2
-        txt_px    = n_lines * line_px + pad_px
-
-        bottom = tk.Frame(self._dash, bg="#000000", height=txt_px)
-        bottom.pack(side="bottom", fill="x")
-        bottom.pack_propagate(False)  # hold the fixed height
-
-        tk.Label(bottom, text="CURRENT LANE ASSIGNMENTS",
-                 font=(main_font, 26, "bold"),
-                 bg="#000000", fg="#00FF7F").pack(pady=5)
-
-        self._dash_match_text = tk.Text(
-            bottom, font=(main_font, 32, "bold"),
-            bg="#000000", fg="#FFFFFF", relief="flat", cursor="arrow",
-            padx=10, pady=12
-        )
-        self._dash_match_text.pack(fill="both", expand=True, padx=50, pady=(0, 10))
-
-        # Standings tree — takes all remaining space between header and bottom section
+        # Standings tree — row 1, shares vertical space with the lanes panel below
         self._dash_tree = ttk.Treeview(
             self._dash,
-            columns=("rank", "name", "wins", "diff"),
-            show="headings", style="Dash.Treeview"
+            columns=("rank", "name", "wins", "diff", "pf", "pa"),
+            show="headings", style="Dash.Treeview",
+            height=1  # keep its natural minimum small so the grid row weight
+                      # (not ttk's default 10-row request) governs the actual size
         )
         for col, label, width, anchor in [
             ("rank", "Rank",         80,  "center"),
-            ("name", "Player / Team",500, "w"),
+            ("name", "Player / Team",500, "center"),
             ("wins", "Wins",         80,  "center"),
             ("diff", "+/-",          80,  "center"),
+            ("pf",   "Points For",   140, "center"),
+            ("pa",   "Points Against", 140, "center"),
         ]:
             self._dash_tree.heading(col, text=label)
             self._dash_tree.column(col, width=width, anchor=anchor)
-        self._dash_tree.pack(fill="both", expand=True, padx=50, pady=10)
+        # Alternating row colors — black / 60% grey — for readability
+        self._dash_tree.tag_configure("stripe_black", background="#1a1a1a")
+        self._dash_tree.tag_configure("stripe_grey",  background="#666666")
+        self._dash_tree.grid(row=1, column=0, sticky="nsew", padx=50, pady=10)
+
+        # Lane assignments — row 2, shares vertical space with the leaderboard above.
+        # The visible-line cap is recalculated from the panel's actual current
+        # height on every live-update tick, so it scrolls exactly when content no
+        # longer fits, whatever size the window is resized to.
+        self._lane_line_px = 47
+        self._lane_visible_lines = 6  # placeholder until the first size measurement
+
+        bottom = tk.Frame(self._dash, bg="#000000")
+        bottom.grid(row=2, column=0, sticky="nsew")
+        self._lane_frame = bottom
+
+        self._lane_title = tk.Label(bottom, text="CURRENT LANE ASSIGNMENTS",
+                 font=(main_font, 26, "bold"),
+                 bg="#000000", fg="#00FF7F")
+        self._lane_title.pack(pady=3)
+
+        self._dash_match_text = tk.Text(
+            bottom, font=(main_font, 32, "bold"), height=1,
+            bg="#000000", fg="#FFFFFF", relief="flat", cursor="arrow",
+            padx=10, pady=6
+        )
+        self._dash_match_text.pack(fill="both", expand=True, padx=50, pady=(0, 6))
+
+        # Announcement bar — row 3, fixed
+        self._dash_msg = tk.Label(self._dash, text="WELCOME!",
+                                  font=(main_font, 36, "bold"),
+                                  bg="#c0392b", fg="white", pady=10)
+        self._dash_msg.grid(row=3, column=0, sticky="ew")
 
         self._scroll_idx = 0
         self._standings_dirty = False     # standings just about to be populated
+        self._lane_scroll_idx = 0
+        self._lane_lines = []
 
         # Populate standings once immediately, then start the independent loops
         self._repopulate_dash_standings()
         self._update_dashboard_live()          # clock / lanes / ticker — every second
         self._dash.after(1500, self._auto_scroll_leaderboard)  # scroll starts after a short pause
+        self._dash.after(1500, self._auto_scroll_lanes)
 
     def _close_dashboard(self):
         """Clean shutdown — cancel pending after() calls before destroying."""
@@ -1159,8 +1226,9 @@ class PetanqueProMaster:
         for row in self._dash_tree.get_children():
             self._dash_tree.delete(row)
         for i, p in enumerate(self.db.get_standings(), 1):
+            tag = "stripe_black" if i % 2 else "stripe_grey"
             self._dash_tree.insert("", "end",
-                values=(i, f"  {p['name']}", p["wins"], p["diff"]))
+                values=(i, p["name"], p["wins"], p["diff"], p["pf"], p["pa"]), tags=(tag,))
         self._standings_dirty = False
 
     def _update_dashboard_live(self):
@@ -1172,21 +1240,26 @@ class PetanqueProMaster:
         # Clock
         self._dash_clock.config(text=datetime.datetime.now().strftime("%H:%M:%S"))
 
+        # Re-measure how many lines currently fit — the panel now resizes with the
+        # window, so this can change whenever the user resizes the dashboard
+        measured_h = self._dash_match_text.winfo_height()
+        if measured_h > 1:
+            self._lane_visible_lines = max(2, measured_h // self._lane_line_px)
+
         # Lane assignments — playing games + up to 2 waiting
         self._dash_match_text.config(state="normal")
         self._dash_match_text.delete("1.0", "end")
         matches = self.db.get_playing_matches()
         waiting = self.db.get_waiting_matches(limit=2)
         if matches:
-            for m in matches:
-                self._dash_match_text.insert(
-                    "end", f"LANE {m['terrain']}:   {m['t1']}   vs   {m['t2']}\n"
-                )
-            for w in waiting:
-                self._dash_match_text.insert(
-                    "end", f"  ⏳   {w['t1']}   vs   {w['t2']}\n"
-                )
+            self._lane_lines = (
+                [f"LANE {m['terrain']}:   {m['t1']}   vs   {m['t2']}" for m in matches]
+                + [f"  ⏳   {w['t1']}   vs   {w['t2']}" for w in waiting]
+            )
+            for line in self._lane_lines:
+                self._dash_match_text.insert("end", line + "\n")
         else:
+            self._lane_lines = []
             target = self._target_rounds()
             completed = self.db.get_current_round() - 1
             if target and completed >= target:
@@ -1195,8 +1268,13 @@ class PetanqueProMaster:
                 self._dash_match_text.insert("end", "\n\n— ROUND FINISHED / WAITING —")
 
         self._dash_match_text.tag_add("center", "1.0", "end")
-        self._dash_match_text.tag_configure("center", justify="center", spacing1=15)
+        self._dash_match_text.tag_configure("center", justify="center", spacing1=8)
         self._dash_match_text.config(state="disabled")
+
+        # Reapply whatever scroll position the auto-scroll loop is currently at,
+        # since the rebuild above just reset the view to the top
+        if len(self._lane_lines) > self._lane_visible_lines and self._lane_scroll_idx > 0:
+            self._dash_match_text.see(f"{min(self._lane_scroll_idx, len(self._lane_lines)) + 1}.0")
 
         # Announcement ticker
         msg = self.announce_entry.get().strip()
@@ -1240,6 +1318,30 @@ class PetanqueProMaster:
             self._scroll_idx = 0
             self._dash_tree.yview_moveto(0)
             self._dash.after(5000, self._auto_scroll_leaderboard)
+
+    def _auto_scroll_lanes(self):
+        if not self._dash_is_alive():
+            return
+
+        visible = self._lane_visible_lines
+
+        # --- At the top: start the crawl only if there's more than fits ---
+        if self._lane_scroll_idx == 0:
+            if len(self._lane_lines) <= visible:
+                self._dash.after(3000, self._auto_scroll_lanes)
+                return
+            self._lane_scroll_idx = visible
+
+        if self._lane_scroll_idx < len(self._lane_lines):
+            self._dash_match_text.see(f"{self._lane_scroll_idx + 1}.0")
+            self._lane_scroll_idx += 1
+            delay = 4000 if self._lane_scroll_idx >= len(self._lane_lines) else 2000
+            self._dash.after(delay, self._auto_scroll_lanes)
+        else:
+            # Bottom reached — snap back to top and pause before next cycle
+            self._lane_scroll_idx = 0
+            self._dash_match_text.yview_moveto(0)
+            self._dash.after(4000, self._auto_scroll_lanes)
 
 
 # ---------------------------------------------------------------------------
